@@ -1,0 +1,1181 @@
+{
+	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
+	"version": "${LEVELS_RANKS_VERSION}",
+	"name": "levels_ranks",
+	"description": "Levels Ranks core: experience, ranks, kill/death/round statistics, the LR menus and the plugin-facing ILRApi. A port of the Metamod:Source plugin 'cs2-lvl_ranks' by Pisex; the database layout (one table, name from lr_table, default lvl_base) is kept identical so a Metamod and a Plugify server can share one database. The eight Pisex LR modules (hits, weapons, maps, geoip, unusual kills, fakeranks, namereward, vip multiplier) talk to this plugin through the exported methods below - see API.md and include/lr_api.hpp.",
+	"author": "Pisex, ported to Plugify",
+	"website": "https://github.com/untrustedmodders/plugify",
+	"license": "GPL-3.0",
+	"entry": "bin/levels_ranks",
+	"platforms": [],
+	"language": "cpp",
+	"dependencies": [
+		{
+			"name": "s2sdk",
+			"constraints": ">=2.18.2"
+		},
+		{
+			"name": "hudmenu",
+			"constraints": ">=1.0.0",
+			"optional": true
+		},
+		{
+			"name": "permissions",
+			"constraints": ">=1.3.1",
+			"optional": true
+		}
+	],
+	"methods": [
+		{
+			"name": "IsCoreLoaded",
+			"funcName": "IsCoreLoaded",
+			"group": "core",
+			"description": "The bActive flag of LRApi: true once the database is connected, the table exists and the configuration has been read, i.e. after the OnCoreIsReady callbacks fired. Modules that loaded late poll this instead of waiting.",
+			"paramTypes": [],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the core finished loading."
+			}
+		},
+		{
+			"name": "GetSettingsValue",
+			"funcName": "GetSettingsValue",
+			"group": "core",
+			"description": "Value of the MainSettings block of settings.ini, indexed by the LR_SettingType enumerators (lvl_ranks.h). The ported constants live in lr_api.hpp (levels_ranks::LR_MinplayersCount = 1, LR_ShowUsualMessage = 4, LR_DB_SaveDataPlayer_Mode = 15, LR_TypeStatistics = 20, ...). Out-of-range indexes answer 0.",
+			"paramTypes": [
+				{
+					"name": "setting",
+					"type": "int32",
+					"ref": false,
+					"description": "LR_SettingType enumerator."
+				}
+			],
+			"retType": {
+				"type": "int32",
+				"description": "The setting's value (0 for an unknown index)."
+			}
+		},
+		{
+			"name": "GetSettingsStatsValue",
+			"funcName": "GetSettingsStatsValue",
+			"group": "core",
+			"description": "Value of the statistics block of settings.ini (Funded_System / Rating_Extended / Rating_Simple, whichever lr_type_statistics selected), indexed by the LR_SettingStatsType enumerators. LR_ExpKillCoefficient (4) holds the Rating_Extended coefficient * 100.",
+			"paramTypes": [
+				{
+					"name": "setting",
+					"type": "int32",
+					"ref": false,
+					"description": "LR_SettingStatsType enumerator."
+				}
+			],
+			"retType": {
+				"type": "int32",
+				"description": "The statistics setting's value (0 for an unknown index)."
+			}
+		},
+		{
+			"name": "GetCountPlayers",
+			"funcName": "GetCountPlayers",
+			"group": "core",
+			"description": "g_iDBCountPlayers of the original: the number of rows of the LR table, read once when the core connected and incremented for every player inserted afterwards. The LR menu shows it as the denominator of the player's place in the top.",
+			"paramTypes": [],
+			"retType": {
+				"type": "int32",
+				"description": "Rows counted in the statistics table."
+			}
+		},
+		{
+			"name": "GetTableName",
+			"funcName": "GetTableName",
+			"group": "core",
+			"description": "The statistics table name (lr_table of settings.ini, default lvl_base). The Pisex modules build their own tables from it (<name>_hits, <name>_weapons, <name>_maps, <name>_geoip, <name>_unusualkills), so a ported module must use this value for its queries as well.",
+			"paramTypes": [],
+			"retType": {
+				"type": "string",
+				"description": "Table name without backticks."
+			}
+		},
+		{
+			"name": "GetRankNames",
+			"funcName": "GetRankNames",
+			"group": "core",
+			"description": "The keys of the Ranks block of settings.ini in file order (rank_1, rank_2, ...). Each key is also a phrase key of lr_core_ranks.phrases.txt: rank number n (1-based) is displayed as the phrase of entry n-1.",
+			"paramTypes": [],
+			"retType": {
+				"type": "string[]",
+				"description": "Rank phrase keys, in configuration order."
+			}
+		},
+		{
+			"name": "GetRankExp",
+			"funcName": "GetRankExp",
+			"group": "core",
+			"description": "The values of the Ranks block of settings.ini in file order - the experience needed for each rank, index 0 being the first rank (normally 0). Entry n-1 belongs to the phrase key of GetRankNames()[n-1].",
+			"paramTypes": [],
+			"retType": {
+				"type": "int32[]",
+				"description": "Experience thresholds, in configuration order."
+			}
+		},
+		{
+			"name": "GetClientStatus",
+			"funcName": "GetClientStatus",
+			"group": "core",
+			"description": "g_iPlayerInfo[slot].bInitialized of the original - true once the statistics row of a connected player was loaded (OnPlayerLoaded fired) and false again on a disconnect or when the player became unusable.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot, 0..63."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the slot's statistics are loaded."
+			}
+		},
+		{
+			"name": "CheckCountPlayers",
+			"funcName": "CheckCountPlayers",
+			"group": "core",
+			"description": "LRApi::CheckCountPlayers(), i.e. g_bAllowStatistic: true while the statistics are being counted for the running round (enough players and, with lr_block_warmup, not in warmup). Every module checks this before awarding experience. Use RoundWithoutValue() to switch it off for the rest of the round.",
+			"paramTypes": [],
+			"retType": {
+				"type": "bool",
+				"description": "Whether statistics are being collected right now."
+			}
+		},
+		{
+			"name": "GetClientInfo",
+			"funcName": "GetClientInfo",
+			"group": "core",
+			"description": "One statistics value of a slot, indexed by the LR_StatsType enumerators (ST_EXP = 0, ST_RANK = 1, ST_KILLS = 2, ST_DEATHS = 3, ST_SHOOTS = 4, ST_HITS = 5, ST_HEADSHOTS = 6, ST_ASSISTS = 7, ST_ROUNDSWIN = 8, ST_ROUNDSLOSE = 9, ST_PLAYTIME = 10, ST_PLACEINTOP = 11, ST_PLACEINTOPTIME = 12). With session = true the per-session array is read instead of the total one; a slot outside 0..63 answers 0 and an unknown index makes the call fail.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot, 0..63."
+				},
+				{
+					"name": "statsType",
+					"type": "int32",
+					"ref": false,
+					"description": "LR_StatsType enumerator, 0..12."
+				},
+				{
+					"name": "session",
+					"type": "bool",
+					"ref": false,
+					"description": "Read the per-session counter instead of the total one."
+				}
+			],
+			"retType": {
+				"type": "int32",
+				"description": "The requested counter (0 for an invalid slot or index)."
+			}
+		},
+		{
+			"name": "RoundWithoutValue",
+			"funcName": "RoundWithoutValue",
+			"group": "core",
+			"description": "LRApi::RoundWithoutValue(): clears g_bAllowStatistic so no experience is counted for the rest of the round (a module calls this when a round should not be rated, e.g. a warmup-like round).",
+			"paramTypes": [],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "ChangeClientValue",
+			"funcName": "ChangeClientValue",
+			"group": "core",
+			"description": "LRApi::ChangeClientValue(): adds giveExp to the player's experience (clamping at 400 while lr_type_statistics is on), updates the session counter and re-checks the rank - the exact body of the original, including its quirk that a negative result clamps the *clamped* value into iGiveExp. Returns false when the slot is not a loaded, authenticated player (CheckStatus) or the change did not happen.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot, 0..63."
+				},
+				{
+					"name": "giveExp",
+					"type": "int32",
+					"ref": false,
+					"description": "Experience to add (may be negative)."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "true when the change was applied to a loaded player."
+			}
+		},
+		{
+			"name": "ResetPlayerStats",
+			"funcName": "ResetPlayerStats",
+			"group": "core",
+			"description": "LRApi::ResetPlayerStats(): resets the in-memory statistics of a loaded player to the start values, re-checks the rank without messages and fires the OnResetPlayerStats callbacks. The row itself is only rewritten on the next save (exactly like the original).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot, 0..63."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "GetDatabaseConfig",
+			"funcName": "GetDatabaseConfig",
+			"group": "core",
+			"description": "Replacement for ILRApi::GetDatabases(): a Plugify plugin cannot share another plugin's connection object (the worker thread and the callback queue belong to the owner), so the connection settings are exported instead and every module opens its own plgdb connection. Returns exactly 6 strings: 0 driver ('mysql' or 'sqlite'), 1 host (for SQLite the file path), 2 port, 3 user, 4 password, 5 database. The table name comes from GetTableName(). Use levels_ranks::LrApi::GetDatabaseConfig() in lr_api.hpp for the named struct and MakeDatabaseConfig().",
+			"paramTypes": [],
+			"retType": {
+				"type": "string[]",
+				"description": "driver, host, port, user, password, database."
+			}
+		},
+		{
+			"name": "PrintToChat",
+			"funcName": "PrintToChat",
+			"group": "core",
+			"description": "The chat printer of LRApi::PrintToChat() minus the varargs: the message is formatted by the caller and this call prepends the 'Prefix' phrase of lr_core.phrases.txt and prints to the slot (slot -1 goes to the server console). lr_api.hpp keeps the printf-style signature of the original so ported call sites do not change.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot, -1 for the server console."
+				},
+				{
+					"name": "message",
+					"type": "string",
+					"ref": false,
+					"description": "Already formatted message."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnCoreIsReady_Register",
+			"funcName": "OnCoreIsReady_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnCoreIsReady listener of the calling plugin - the HookOnCoreIsReady of the original, whose PluginId argument is gone: every plugin registers one function per event and registering the same function pointer again is a no-op. The listener fires once, when the database is up and settings.ini was read; a plugin that registers after that must check IsCoreLoaded() itself, because the event does not fire twice.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "CoreReadyCallback",
+						"funcName": "CoreReadyCallback",
+						"description": "Called once the LR core is loaded.",
+						"paramTypes": [],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnCoreIsReady_Unregister",
+			"funcName": "OnCoreIsReady_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnCoreIsReady listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "CoreReadyCallback",
+						"funcName": "CoreReadyCallback",
+						"description": "Called once the LR core is loaded.",
+						"paramTypes": [],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnLevelChangedPre_Register",
+			"funcName": "OnLevelChangedPre_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires whenever a player's rank changes, before the new rank is stored. newLevel is passed by reference: a module may replace it (the change is honoured by the core, exactly like the int& of the original typedef) while iOldLevel is read-only.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "LevelChangedPreCallback",
+						"funcName": "LevelChangedPreCallback",
+						"description": "Called before the rank of a player is changed; may rewrite newLevel.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "newLevel",
+								"type": "int32",
+								"ref": true,
+								"description": "Rank the player is about to reach; may be changed in place."
+							},
+							{
+								"name": "oldLevel",
+								"type": "int32",
+								"ref": false,
+								"description": "Rank before the change."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnLevelChangedPre_Unregister",
+			"funcName": "OnLevelChangedPre_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnLevelChangedPre listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "LevelChangedPreCallback",
+						"funcName": "LevelChangedPreCallback",
+						"description": "Called before the rank of a player is changed; may rewrite newLevel.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "newLevel",
+								"type": "int32",
+								"ref": true,
+								"description": "Rank the player is about to reach; may be changed in place."
+							},
+							{
+								"name": "oldLevel",
+								"type": "int32",
+								"ref": false,
+								"description": "Rank before the change."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnLevelChangedPost_Register",
+			"funcName": "OnLevelChangedPost_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires after a rank change was applied (the rank stored, the messages printed and, with lr_db_savedataplayer_mode, the row saved).",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "LevelChangedPostCallback",
+						"funcName": "LevelChangedPostCallback",
+						"description": "Called after the rank of a player was changed.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "newLevel",
+								"type": "int32",
+								"ref": false,
+								"description": "Rank the player reached."
+							},
+							{
+								"name": "oldLevel",
+								"type": "int32",
+								"ref": false,
+								"description": "Rank before the change."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnLevelChangedPost_Unregister",
+			"funcName": "OnLevelChangedPost_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnLevelChangedPost listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "LevelChangedPostCallback",
+						"funcName": "LevelChangedPostCallback",
+						"description": "Called after the rank of a player was changed.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "newLevel",
+								"type": "int32",
+								"ref": false,
+								"description": "Rank the player reached."
+							},
+							{
+								"name": "oldLevel",
+								"type": "int32",
+								"ref": false,
+								"description": "Rank before the change."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerKilledPre_Register",
+			"funcName": "OnPlayerKilledPre_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires while a kill is being rated, before the experience is applied: the LR modules use it to scale expCaused (VIP multiplier, name reward) or to inspect the kill (weapon). The original passed IGameEvent*; Plugify cannot put an engine pointer behind its own type check, so the s2sdk event handle crosses as int64 and lr_api.hpp rebuilds the pisex::IGameEvent* the modules are written against (valid for the duration of the callback). expCaused is by reference and the change is honoured; expVictim/expAttacker are the victims'/attacker's experience before the change.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerKilledPreCallback",
+						"funcName": "PlayerKilledPreCallback",
+						"description": "Called before the kill's experience is applied; may rewrite expCaused.",
+						"paramTypes": [
+							{
+								"name": "event",
+								"type": "int64",
+								"ref": false,
+								"description": "Opaque handle of the player_death event, only valid inside the callback."
+							},
+							{
+								"name": "expCaused",
+								"type": "int32",
+								"ref": true,
+								"description": "Experience the attacker is about to gain; may be changed in place."
+							},
+							{
+								"name": "expVictim",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience of the victim before the change."
+							},
+							{
+								"name": "expAttacker",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience of the attacker before the change."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerKilledPre_Unregister",
+			"funcName": "OnPlayerKilledPre_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnPlayerKilledPre listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerKilledPreCallback",
+						"funcName": "PlayerKilledPreCallback",
+						"description": "Called before the kill's experience is applied; may rewrite expCaused.",
+						"paramTypes": [
+							{
+								"name": "event",
+								"type": "int64",
+								"ref": false,
+								"description": "Opaque handle of the player_death event, only valid inside the callback."
+							},
+							{
+								"name": "expCaused",
+								"type": "int32",
+								"ref": true,
+								"description": "Experience the attacker is about to gain; may be changed in place."
+							},
+							{
+								"name": "expVictim",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience of the victim before the change."
+							},
+							{
+								"name": "expAttacker",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience of the attacker before the change."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerKilledPost_Register",
+			"funcName": "OnPlayerKilledPost_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires after a kill was rated and applied (kills, deaths, headshots and streaks counted). Same event handle and arguments as OnPlayerKilledPre, expCaused is the value that was applied.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerKilledPostCallback",
+						"funcName": "PlayerKilledPostCallback",
+						"description": "Called after the kill's experience was applied.",
+						"paramTypes": [
+							{
+								"name": "event",
+								"type": "int64",
+								"ref": false,
+								"description": "Opaque handle of the player_death event, only valid inside the callback."
+							},
+							{
+								"name": "expCaused",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience the attacker gained."
+							},
+							{
+								"name": "expVictim",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience of the victim after the change."
+							},
+							{
+								"name": "expAttacker",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience of the attacker after the change."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerKilledPost_Unregister",
+			"funcName": "OnPlayerKilledPost_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnPlayerKilledPost listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerKilledPostCallback",
+						"funcName": "PlayerKilledPostCallback",
+						"description": "Called after the kill's experience was applied.",
+						"paramTypes": [
+							{
+								"name": "event",
+								"type": "int64",
+								"ref": false,
+								"description": "Opaque handle of the player_death event, only valid inside the callback."
+							},
+							{
+								"name": "expCaused",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience the attacker gained."
+							},
+							{
+								"name": "expVictim",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience of the victim after the change."
+							},
+							{
+								"name": "expAttacker",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience of the attacker after the change."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerLoaded_Register",
+			"funcName": "OnPlayerLoaded_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires when the statistics of a player were loaded (an existing row) or created (a new row inserted). The steamid is the converted STEAM_1:x:y string the original's g_iPlayerInfo[slot].szAuth held.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerLoadedCallback",
+						"funcName": "PlayerLoadedCallback",
+						"description": "Called when a player's statistics became available.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "steamid",
+								"type": "string",
+								"ref": false,
+								"description": "STEAM_1:x:y form of the player's steam id."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerLoaded_Unregister",
+			"funcName": "OnPlayerLoaded_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnPlayerLoaded listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerLoadedCallback",
+						"funcName": "PlayerLoadedCallback",
+						"description": "Called when a player's statistics became available.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "steamid",
+								"type": "string",
+								"ref": false,
+								"description": "STEAM_1:x:y form of the player's steam id."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnResetPlayerStats_Register",
+			"funcName": "OnResetPlayerStats_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires after the statistics of a player were reset (the 'reset my stats' menu entry or the mm_lvl_reset command path that reloads the player). Modules use it to clear their own per-player tables.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ResetPlayerStatsCallback",
+						"funcName": "ResetPlayerStatsCallback",
+						"description": "Called after a player's statistics were reset.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "steamid",
+								"type": "string",
+								"ref": false,
+								"description": "STEAM_1:x:y form of the player's steam id."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnResetPlayerStats_Unregister",
+			"funcName": "OnResetPlayerStats_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnResetPlayerStats listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ResetPlayerStatsCallback",
+						"funcName": "ResetPlayerStatsCallback",
+						"description": "Called after a player's statistics were reset.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "steamid",
+								"type": "string",
+								"ref": false,
+								"description": "STEAM_1:x:y form of the player's steam id."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerPosInTop_Register",
+			"funcName": "OnPlayerPosInTop_Register",
+			"group": "callbacks",
+			"description": "Registers the listener for the place-in-top refresh: after every save of a loaded player the core queries the player's position by experience and by playtime and reports both. This is the hook the original fired from the SaveDataPlayer callback.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerPosInTopCallback",
+						"funcName": "PlayerPosInTopCallback",
+						"description": "Called with the player's positions after a save.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "expPos",
+								"type": "int32",
+								"ref": false,
+								"description": "Place in the top ordered by experience, 1-based."
+							},
+							{
+								"name": "timePos",
+								"type": "int32",
+								"ref": false,
+								"description": "Place in the top ordered by playtime, 1-based."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerPosInTop_Unregister",
+			"funcName": "OnPlayerPosInTop_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnPlayerPosInTop listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerPosInTopCallback",
+						"funcName": "PlayerPosInTopCallback",
+						"description": "Called with the player's positions after a save.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "expPos",
+								"type": "int32",
+								"ref": false,
+								"description": "Place in the top ordered by experience, 1-based."
+							},
+							{
+								"name": "timePos",
+								"type": "int32",
+								"ref": false,
+								"description": "Place in the top ordered by playtime, 1-based."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnExpChangedPre_Register",
+			"funcName": "OnExpChangedPre_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires before experience is added to a player (every NotifClient call, i.e. kills, assists, rounds, bombs, hostages, the admin give/take menu and the module's own ChangeClientValue path). giveExp is by reference and a module may replace it; a value changed to 0 makes the core skip the change, exactly like the original.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ExpChangedPreCallback",
+						"funcName": "ExpChangedPreCallback",
+						"description": "Called before experience is applied; may rewrite giveExp.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "giveExp",
+								"type": "int32",
+								"ref": true,
+								"description": "Experience about to be added; may be changed in place."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnExpChangedPre_Unregister",
+			"funcName": "OnExpChangedPre_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnExpChangedPre listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ExpChangedPreCallback",
+						"funcName": "ExpChangedPreCallback",
+						"description": "Called before experience is applied; may rewrite giveExp.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "giveExp",
+								"type": "int32",
+								"ref": true,
+								"description": "Experience about to be added; may be changed in place."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnExpChangedPost_Register",
+			"funcName": "OnExpChangedPost_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires after experience was applied to a player: giveExp is the amount actually applied (clamping and floor included, exactly the iExpBuffer of the original) and newExpCount the player's new total.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ExpChangedPostCallback",
+						"funcName": "ExpChangedPostCallback",
+						"description": "Called after experience was applied.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "giveExp",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience actually applied."
+							},
+							{
+								"name": "newExpCount",
+								"type": "int32",
+								"ref": false,
+								"description": "The player's new experience total."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnExpChangedPost_Unregister",
+			"funcName": "OnExpChangedPost_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnExpChangedPost listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ExpChangedPostCallback",
+						"funcName": "ExpChangedPostCallback",
+						"description": "Called after experience was applied.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot, 0..63."
+							},
+							{
+								"name": "giveExp",
+								"type": "int32",
+								"ref": false,
+								"description": "Experience actually applied."
+							},
+							{
+								"name": "newExpCount",
+								"type": "int32",
+								"ref": false,
+								"description": "The player's new experience total."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnDatabaseCleanup_Register",
+			"funcName": "OnDatabaseCleanup_Register",
+			"group": "callbacks",
+			"description": "Registers the listener that fires when the mm_lvl_reset command wiped the statistics table, so modules can wipe their own <table>_hits/_weapons/... tables with the same type. type is 0 = all data, 1 = experience, 2 = statistics.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "DatabaseCleanupCallback",
+						"funcName": "DatabaseCleanupCallback",
+						"description": "Called when the LR data was cleared; type is LR_CleanupType (0 all, 1 exp, 2 stats).",
+						"paramTypes": [
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = all data, 1 = experience, 2 = statistics."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnDatabaseCleanup_Unregister",
+			"funcName": "OnDatabaseCleanup_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnDatabaseCleanup listener previously registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "DatabaseCleanupCallback",
+						"funcName": "DatabaseCleanupCallback",
+						"description": "Called when the LR data was cleared; type is LR_CleanupType (0 all, 1 exp, 2 stats).",
+						"paramTypes": [
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = all data, 1 = experience, 2 = statistics."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		}
+	]
+}
