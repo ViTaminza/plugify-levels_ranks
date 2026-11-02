@@ -164,7 +164,10 @@ protected:
 
 private:
 	// Retries the statement after reconnecting up to config().maxReconnectAttempts
-	// times when the failure is a lost/unavailable connection.
+	// times when the failure is a lost/unavailable connection *and* the statement never
+	// reached the server. Once mysql_stmt_execute() was called the server may have
+	// committed it even though the client saw the connection drop, so it is never sent
+	// a second time: the error goes back to the caller.
 	Result RunStatement(const std::string& sql, const Params& params, bool allowReconnect, bool* connLostOut) {
 		unsigned attempts = 0;
 		for (;;) {
@@ -183,20 +186,28 @@ private:
 			}
 
 			bool lost = false;
-			Result result = RunStatementOnce(sql, params, lost);
+			bool executed = false;
+			Result result = RunStatementOnce(sql, params, lost, executed);
 			if (connLostOut) *connLostOut = lost;
 			if (result.Ok() || !lost) return result;
 
-			Log("plgdb(mysql): lost connection, reconnecting");
 			CloseConnection();
+			// Already sent: its outcome is unknown (the server may have applied it), so
+			// resending the statement could execute it twice.
+			if (executed) {
+				Log("plgdb(mysql): lost connection after the statement was sent");
+				return result;
+			}
+			Log("plgdb(mysql): lost connection, reconnecting");
 			if (!allowReconnect || attempts >= config().maxReconnectAttempts) return result;
 			++attempts;
 		}
 	}
 
-	Result RunStatementOnce(const std::string& sql, const Params& params, bool& connLost) {
+	Result RunStatementOnce(const std::string& sql, const Params& params, bool& connLost, bool& executed) {
 		Result result;
 		connLost = false;
+		executed = false;
 
 		if (sql.empty()) {
 			result.error = "plgdb(mysql): empty statement";
@@ -287,6 +298,9 @@ private:
 			}
 		}
 
+		// From here on the statement may reach the server (and commit) even if the call
+		// reports a lost connection: RunStatement must not resend it.
+		executed = true;
 		if (mysql_stmt_execute(stmt.get()) != 0) {
 			result.error = StmtErrorString(stmt.get());
 			connLost = IsConnectionError(mysql_stmt_errno(stmt.get()), mysql_stmt_sqlstate(stmt.get()));
@@ -416,11 +430,22 @@ private:
 			return false;
 		}
 
-		unsigned int timeout = config().connectTimeoutSec;
-		if (timeout == 0) timeout = 5;
-		mysql_options(handle, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
-		mysql_options(handle, MYSQL_OPT_READ_TIMEOUT, &timeout);
-		mysql_options(handle, MYSQL_OPT_WRITE_TIMEOUT, &timeout);
+		unsigned int connectTimeout = config().connectTimeoutSec;
+		if (connectTimeout == 0) connectTimeout = 5;
+		mysql_options(handle, MYSQL_OPT_CONNECT_TIMEOUT, &connectTimeout);
+		// Connecting and executing a statement have separate budgets: a bulk save or a long
+		// migration on a healthy server regularly takes longer than a TCP connect. 0 keeps
+		// the connector default (no timeout). Never go below the connect timeout: plugins
+		// that raise connectTimeoutSec as their single "timeout" knob (WeaponSkins, up to
+		// 30 s) used to get that value for statements too.
+		unsigned int readWriteTimeout = config().readWriteTimeoutSec;
+		if (readWriteTimeout != 0) {
+			if (readWriteTimeout < connectTimeout) {
+				readWriteTimeout = connectTimeout;
+			}
+			mysql_options(handle, MYSQL_OPT_READ_TIMEOUT, &readWriteTimeout);
+			mysql_options(handle, MYSQL_OPT_WRITE_TIMEOUT, &readWriteTimeout);
+		}
 		if (!config().charset.empty()) {
 			mysql_options(handle, MYSQL_SET_CHARSET_NAME, config().charset.c_str());
 		}

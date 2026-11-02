@@ -12,6 +12,12 @@ namespace {
 std::mutex g_loggerMutex;
 std::function<void(std::string_view)> g_logger;
 
+// How long the worker keeps flushing the queue after StopWorker() was called. A healthy
+// database drains in milliseconds; an unreachable one costs up to
+// (maxReconnectAttempts + 1) * connectTimeout per statement, so a long queue must not block
+// the plugin unload (and the game thread) for minutes.
+constexpr auto kShutdownDrainBudget = std::chrono::seconds(3);
+
 } // namespace
 
 void SetLogger(std::function<void(std::string_view)> logger) {
@@ -54,6 +60,7 @@ void DatabaseBase::StopWorker() {
 		std::lock_guard<std::mutex> lock(queueMutex_);
 		if (!worker_.joinable()) return; // already stopped (or never started)
 		stopping_ = true;
+		stopRequested_ = std::chrono::steady_clock::now();
 	}
 	queueCv_.notify_all();
 	worker_.join();
@@ -143,12 +150,39 @@ size_t DatabaseBase::Poll() {
 void DatabaseBase::WorkerMain() {
 	for (;;) {
 		Job job;
+		size_t dropped = 0;
+		std::vector<std::shared_ptr<SyncSlot>> droppedSync;
 		{
 			std::unique_lock<std::mutex> lock(queueMutex_);
 			queueCv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
 			if (queue_.empty()) break; // stopping_ && nothing left to flush
-			job = std::move(queue_.front());
-			queue_.pop_front();
+			if (stopping_ && std::chrono::steady_clock::now() - stopRequested_ >= kShutdownDrainBudget) {
+				// Shutdown drain budget exhausted (unreachable database or a long queue): the
+				// rest is dropped instead of blocking the caller for ~10 s per statement.
+				dropped = queue_.size();
+				for (const Job& queued : queue_) {
+					if (queued.sync) droppedSync.push_back(queued.sync);
+				}
+				queue_.clear();
+				pending_.fetch_sub(dropped, std::memory_order_relaxed);
+			} else {
+				job = std::move(queue_.front());
+				queue_.pop_front();
+			}
+		}
+
+		if (dropped != 0) {
+			// QuerySync callers are blocked on their slot: complete them so they cannot hang.
+			for (const std::shared_ptr<SyncSlot>& slot : droppedSync) {
+				{
+					std::lock_guard<std::mutex> lock(slot->mutex);
+					slot->result.error = "plgdb: database is shutting down";
+					slot->done = true;
+				}
+				slot->cv.notify_all();
+			}
+			Log("plgdb: dropped " + std::to_string(dropped) + " queued statements at shutdown");
+			break;
 		}
 
 		Result result = RunJob(job);

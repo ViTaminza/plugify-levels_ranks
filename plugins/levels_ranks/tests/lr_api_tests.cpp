@@ -226,7 +226,7 @@ void TestUnavailable() {
 	// Registering a listener without the plugin is a no-op, unregistering must not crash.
 	api.HookOnCoreIsReady([] {});
 	api.UnhookOnCoreIsReady();
-	api.HookOnPlayerKilledPre([](pisex::IGameEvent*, int&, int, int) {});
+	api.HookOnPlayerKilledPreEvent([](void*, int&, int, int) {});
 	api.UnhookOnPlayerKilledPre();
 }
 
@@ -350,11 +350,12 @@ void TestTrampolines() {
 	g_level_pre_callback(5, level, 2);
 	CHECK_EQ_INT(level, 9);
 
-	// OnPlayerKilledPre: the event handle is rebuilt as a pisex::IGameEvent* and the exp is
-	// written back.
+	// OnPlayerKilledPreEvent: the s2sdk event handle crosses the boundary as a raw pointer and the
+	// exp is written back. (The pisex::IGameEvent spelling of the wrapper is optional: without
+	// pisexcompat the header falls back to the void* callback.)
 	int64_t seen_event = -1;
-	api.HookOnPlayerKilledPre([&seen_event](pisex::IGameEvent* event, int& exp_caused, int exp_victim, int exp_attacker) {
-		seen_event = event != nullptr ? static_cast<int64_t>(reinterpret_cast<intptr_t>(event->Native())) : -1;
+	api.HookOnPlayerKilledPreEvent([&seen_event](void* event, int& exp_caused, int exp_victim, int exp_attacker) {
+		seen_event = static_cast<int64_t>(reinterpret_cast<intptr_t>(event));
 		CHECK_EQ_INT(exp_victim, 100);
 		CHECK_EQ_INT(exp_attacker, 200);
 		exp_caused *= 3;

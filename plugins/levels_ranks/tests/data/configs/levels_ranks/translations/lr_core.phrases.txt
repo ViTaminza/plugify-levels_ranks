@@ -1,0 +1,17 @@
+"Phrases"
+{
+	"Prefix"
+	{
+		"ru" "[LR]"
+		"en" "[LR]"
+	}
+	"Multi"
+	{
+		"ru" "RU text"
+		"en" "EN text"
+	}
+	"OnlyEn"
+	{
+		"en" "English only"
+	}
+}

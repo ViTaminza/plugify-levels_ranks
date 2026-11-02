@@ -38,6 +38,10 @@ struct Config {
 	std::string database;
 	std::string charset = "utf8mb4";
 	unsigned connectTimeoutSec = 5;
+	// Read/write timeout of an established connection, in seconds. 0 leaves the connector
+	// default (no timeout). Keep this well above the slowest expected statement: a healthy but
+	// busy server (a bulk save, an InnoDB lock wait) must not have its statement aborted.
+	unsigned readWriteTimeoutSec = 15;
 	// SQLite
 	std::string sqlitePath; // file path; ":memory:" allowed for tests
 	// Both

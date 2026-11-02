@@ -29,26 +29,10 @@
 
 #include <plgdb/db.hpp>
 
-#include <plg/plugin.hpp>
-#include <pisex/keyvalues.hpp>
 
 #include "lr_core.hpp"
 #include "lr_keyvalues.hpp"
-
-// The plg globals a Plugify plugin defines through PLUGIFY_PLUGIN; pisexcompat (the KV1 parser
-// used here) references a few of them, so the test provides them (null = the fallbacks apply).
-namespace plg {
-GetBaseDirFn GetBaseDir{nullptr};
-GetExtensionsDirFn GetExtensionsDir{nullptr};
-GetConfigsDirFn GetConfigsDir{nullptr};
-GetDataDirFn GetDataDir{nullptr};
-GetLogsDirFn GetLogsDir{nullptr};
-GetCacheDirFn GetCacheDir{nullptr};
-IsLoadedFn IsLoaded{nullptr};
-LogFn Log{nullptr};
-BeginZoneFn BeginZone{nullptr};
-EndZoneFn EndZone{nullptr};
-} // namespace plg
+#include "lr_kv1.hpp"
 
 #ifndef LR_TEST_DATA_DIR
 #define LR_TEST_DATA_DIR "."
@@ -291,7 +275,7 @@ void TestSettingsCoefficientClamp() {
 void TestShippedSettingsFile() {
 	Section("the shipped settings.ini");
 	const std::string path = std::string(LR_TEST_DATA_DIR) + "/settings.ini";
-	pisex::KeyValues kv("LR_Settings");
+	levels_ranks::KeyValues kv("LR_Settings");
 	if (!kv.LoadFromFile(path)) {
 		std::printf("FATAL: cannot read %s\n", path.c_str());
 		++g_failures;
@@ -537,6 +521,30 @@ void RunDatabaseSuite(const plgdb::Config& config, const char* label) {
 		std::mt19937_64 rng(static_cast<uint64_t>(::getpid()) ^ static_cast<uint64_t>(std::time(nullptr)));
 		return 1'000'000ULL + rng() % 1'000'000'000ULL;
 	}();
+
+	// --- the asynchronous schema creation of the plugin --------------------------------
+	{
+		Section("asynchronous schema creation");
+		std::unique_ptr<plgdb::Database> db = plgdb::Database::Create(config);
+		CHECK(db != nullptr);
+		if (db != nullptr) {
+			LrCore core(*db);
+			Settings settings = BaseSettings();
+			settings.table_name = "lra_" + std::to_string(base % 1000000);
+			core.SetSettings(settings);
+			bool finished = false;
+			bool ok = false;
+			core.CreateSchemaAsync([&](bool result) {
+				finished = true;
+				ok = result;
+			});
+			CHECK(Wait(*db, [&] { return finished; }));
+			CHECK(ok);
+			const plgdb::Result count = db->QuerySync("SELECT COUNT(*) FROM " + core.Table() + ";", {});
+			CHECK_QUERY_OK(count);
+			(void)db->QuerySync("DROP TABLE " + core.Table() + ";", {});
+		}
+	}
 
 	// --- load a fresh player, then save it ------------------------------------------------
 	{
@@ -870,6 +878,21 @@ void RunDatabaseSuite(const plgdb::Config& config, const char* label) {
 		CHECK(Wait(*fx.db, [&] { return time_calls == 1; }));
 		CHECK_EQ_INT(by_time.size(), 2);
 		CHECK(by_time[0].value >= 2.0 - 0.001 && by_time[0].value <= 2.0 + 0.001); // 7200 s in hours
+
+		// Within kTopCacheSeconds the list is served from memory: the callback runs immediately
+		// and no second query is issued (a !top key bind must not sort the table each time).
+		fx.now += levels_ranks::kTopCacheSeconds - 1;
+		int cached_calls = 0;
+		fx.core->LoadTopPlayers(false, [&](std::vector<levels_ranks::TopRow> result) {
+			++cached_calls;
+			CHECK_EQ_INT(result.size(), 2);
+		});
+		CHECK_EQ_INT(cached_calls, 1); // synchronous: no Wait()
+		// After the cache expired the database is asked again.
+		fx.now += 2;
+		int refreshed_calls = 0;
+		fx.core->LoadTopPlayers(false, [&](std::vector<levels_ranks::TopRow>) { ++refreshed_calls; });
+		CHECK(Wait(*fx.db, [&] { return refreshed_calls == 1; }));
 	}
 
 	// --- the cleanup command -------------------------------------------------------------------

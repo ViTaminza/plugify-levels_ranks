@@ -141,6 +141,8 @@ using OnLevelChangedPre = std::function<void(int iSlot, int& iNewLevel, int iOld
 using OnLevelChangedPost = std::function<void(int iSlot, int iNewLevel, int iOldLevel)>;
 using OnPlayerKilledPre = std::function<void(pisex::IGameEvent* hEvent, int& iExpCaused, int iExpVictim, int iExpAttacker)>;
 using OnPlayerKilledPost = std::function<void(pisex::IGameEvent* hEvent, int iExpCaused, int iExpVictim, int iExpAttacker)>;
+using OnPlayerKilledPreEvent = std::function<void(void* event, int& iExpCaused, int iExpVictim, int iExpAttacker)>;
+using OnPlayerKilledPostEvent = std::function<void(void* event, int iExpCaused, int iExpVictim, int iExpAttacker)>;
 using OnPlayerLoaded = std::function<void(int iSlot, const char* SteamID)>;
 using OnResetPlayerStats = std::function<void(int iSlot, const char* SteamID)>;
 using OnPlayerPosInTop = std::function<void(int iSlot, int iExpPos, int iTimePos)>;
@@ -188,6 +190,8 @@ struct State {
 	OnLevelChangedPost levelChangedPost;
 	OnPlayerKilledPre playerKilledPre;
 	OnPlayerKilledPost playerKilledPost;
+	OnPlayerKilledPreEvent playerKilledPreEvent;
+	OnPlayerKilledPostEvent playerKilledPostEvent;
 	OnPlayerLoaded playerLoaded;
 	OnResetPlayerStats resetPlayerStats;
 	OnPlayerPosInTop playerPosInTop;
@@ -242,13 +246,19 @@ inline void LevelChangedPostTrampoline(int32_t slot, int32_t new_level, int32_t 
 
 inline void PlayerKilledPreTrampoline(int64_t event, int32_t& exp_caused, int32_t exp_victim, int32_t exp_attacker) {
 	try {
+		void* rawEvent = reinterpret_cast<void*>(static_cast<intptr_t>(event));
+		if (const auto& callback = S().playerKilledPreEvent) {
+			int caused = exp_caused;
+			callback(rawEvent, caused, exp_victim, exp_attacker);
+			exp_caused = caused;
+		}
 		if (const auto& callback = S().playerKilledPre) {
 			int caused = exp_caused;
 #if LR_API_HAS_PISEX_EVENTS
-			pisex::IGameEvent handle(reinterpret_cast<void*>(static_cast<intptr_t>(event)));
+			pisex::IGameEvent handle(rawEvent);
 			callback(&handle, caused, exp_victim, exp_attacker);
 #else
-			(void)event;
+			(void)rawEvent;
 			callback(nullptr, caused, exp_victim, exp_attacker);
 #endif
 			exp_caused = caused;
@@ -260,12 +270,16 @@ inline void PlayerKilledPreTrampoline(int64_t event, int32_t& exp_caused, int32_
 
 inline void PlayerKilledPostTrampoline(int64_t event, int32_t exp_caused, int32_t exp_victim, int32_t exp_attacker) {
 	try {
+		void* rawEvent = reinterpret_cast<void*>(static_cast<intptr_t>(event));
+		if (const auto& callback = S().playerKilledPostEvent) {
+			callback(rawEvent, exp_caused, exp_victim, exp_attacker);
+		}
 		if (const auto& callback = S().playerKilledPost) {
 #if LR_API_HAS_PISEX_EVENTS
-			pisex::IGameEvent handle(reinterpret_cast<void*>(static_cast<intptr_t>(event)));
+			pisex::IGameEvent handle(rawEvent);
 			callback(&handle, exp_caused, exp_victim, exp_attacker);
 #else
-			(void)event;
+			(void)rawEvent;
 			callback(nullptr, exp_caused, exp_victim, exp_attacker);
 #endif
 		}
@@ -490,19 +504,33 @@ public:
 
 	void HookOnPlayerKilledPre(const OnPlayerKilledPre& fn) {
 		detail::S().playerKilledPre = fn;
+		detail::S().playerKilledPreEvent = nullptr;
+		Register(__levels_ranks_OnPlayerKilledPre_Register, detail::PlayerKilledPreTrampoline, fn != nullptr);
+	}
+	void HookOnPlayerKilledPreEvent(const OnPlayerKilledPreEvent& fn) {
+		detail::S().playerKilledPreEvent = fn;
+		detail::S().playerKilledPre = nullptr;
 		Register(__levels_ranks_OnPlayerKilledPre_Register, detail::PlayerKilledPreTrampoline, fn != nullptr);
 	}
 	void UnhookOnPlayerKilledPre() {
 		detail::S().playerKilledPre = nullptr;
+		detail::S().playerKilledPreEvent = nullptr;
 		Unregister(__levels_ranks_OnPlayerKilledPre_Unregister, detail::PlayerKilledPreTrampoline);
 	}
 
 	void HookOnPlayerKilledPost(const OnPlayerKilledPost& fn) {
 		detail::S().playerKilledPost = fn;
+		detail::S().playerKilledPostEvent = nullptr;
+		Register(__levels_ranks_OnPlayerKilledPost_Register, detail::PlayerKilledPostTrampoline, fn != nullptr);
+	}
+	void HookOnPlayerKilledPostEvent(const OnPlayerKilledPostEvent& fn) {
+		detail::S().playerKilledPostEvent = fn;
+		detail::S().playerKilledPost = nullptr;
 		Register(__levels_ranks_OnPlayerKilledPost_Register, detail::PlayerKilledPostTrampoline, fn != nullptr);
 	}
 	void UnhookOnPlayerKilledPost() {
 		detail::S().playerKilledPost = nullptr;
+		detail::S().playerKilledPostEvent = nullptr;
 		Unregister(__levels_ranks_OnPlayerKilledPost_Unregister, detail::PlayerKilledPostTrampoline);
 	}
 

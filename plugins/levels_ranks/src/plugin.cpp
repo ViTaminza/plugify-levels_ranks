@@ -1,23 +1,36 @@
 // levels_ranks — engine side of the plugin. This file ports levels_ranks.cpp of the Pisex
-// cs2-lvl_ranks plugin onto lr_core (settings, ranks, statistics, SQL) and libs/pisexcompat
-// (chat, menus, timers, events, players, KeyValues, phrases).
+// cs2-lvl_ranks plugin onto lr_core (settings, ranks, statistics, SQL) and the native s2sdk API.
 //
 // The port keeps the structure of the original:
-//   * LoadConfig()          -> LoadSettingsFile() (the pisexcompat KV parser fills the core's
+//   * LoadConfig()          -> LoadSettingsFile() (the plugin-local KV1 reader fills the core's
 //                              Settings through the KeyValuesView adapter below);
-//   * AllPluginsLoaded()    -> EnsureCore() + RegisterListeners() + RegisterCommands();
+//   * AllPluginsLoaded()    -> EnsureCore() + RegisterListeners() + RegisterCommands() +
+//                              RegisterGameEvents();
 //   * the IServerGameClients ClientPutInServer/ClientDisconnect hooks -> the s2sdk listeners plus
 //                              a once-per-second reconcile (s2sdk's OnClientAuthenticated is not
 //                              reliable, see perm_connector);
-//   * the IUtilsApi event hooks -> pisex::g_pUtils->HookEvent() with the same handler bodies;
+//   * the IUtilsApi event hooks -> s2sdk::HookEvent() with the same handler bodies;
 //   * the LRApi methods      -> the exported methods at the bottom of this file.
 //
-// Threading: everything runs on the game thread (the plugify pump, s2sdk callbacks, timers). The
-// database is plgdb (one worker thread, results delivered from Poll()).
+// Game-event fields (P1 fix): every player-typed field (userid/attacker/assister of player_death,
+// player_hurt, weapon_fire, bomb_*, hostage_*, round_mvp) is read through EventPlayerSlot()
+// (lr_event_fields.hpp), because GetEventInt answers the engine user id, not the 0..63 slot the
+// core indexes with. bomb_pickup.userid is a player_pawn field, so a field the primary slot
+// accessor cannot resolve falls back to GetEventPlayerPawn + EntPointerToPlayerSlot behind the map
+// gate. Numeric fields (round_end.winner, damage, headshot, ...) keep GetEventInt.
+//
+// Threading: everything runs on the game thread (the plugify pump, s2sdk callbacks, OnPluginUpdate).
+// The database is plgdb (one worker thread, results delivered from Poll()).
 
 #include "lr_plugin.hpp"
 
+#include "lr_commands.hpp"
+#include "lr_event_fields.hpp"
 #include "lr_keyvalues.hpp"
+#include "lr_kv1.hpp"
+#include "lr_menus.hpp"
+#include "lr_paths.hpp"
+#include "lr_phrases.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -25,6 +38,7 @@
 #include <cstdio>
 #include <ctime>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include <permissions/permissions.hpp>
@@ -34,13 +48,6 @@ namespace levels_ranks {
 LrPlugin g_lr_plugin;
 
 namespace {
-
-// One non-empty plg::Log call; the host may run with logging disabled.
-void LogError(std::string_view message) {
-	if (plg::Log) {
-		plg::Log(message, plg::Severity::Error, plg::source_location::current());
-	}
-}
 
 std::string_view TrimSpaces(std::string_view text) {
 	const auto begin = text.find_first_not_of(" \t\r\n");
@@ -53,8 +60,7 @@ std::string_view TrimSpaces(std::string_view text) {
 
 // engine->GetPlayerNetworkIDString() + ConvertSteamID() of the original: CS2 reports the SteamID
 // in the "[U:1:accountid]" form and the table of the original stores the "STEAM_1:x:y" one. A
-// value that already is in STEAM_1 form (s2sdk's GetClientAuthId can hand that out) is passed
-// through unchanged - the original's converter would have mangled it.
+// value that already is in STEAM_1 form is passed through unchanged.
 std::string ConvertSteamID(std::string_view input) {
 	const std::string trimmed(TrimSpaces(input));
 	if (trimmed.empty()) {
@@ -67,7 +73,6 @@ std::string ConvertSteamID(std::string_view input) {
 	text.erase(std::remove(text.begin(), text.end(), '['), text.end());
 	text.erase(std::remove(text.begin(), text.end(), ']'), text.end());
 
-	// "U:1:accountid" (or any 3-part form): the original splits on ':' and rebuilds STEAM_1.
 	std::vector<std::string> parts;
 	std::size_t start = 0;
 	while (start <= text.size()) {
@@ -131,6 +136,10 @@ constexpr const char* kStreakPhrases[] = {"DoubleKill", "TripleKill", "Dominatio
 										  "MegaKill",   "Ownage",     "UltraKill",    "KillingSpree",
 										  "MonsterKill", "Unstoppable", "GodLike"};
 
+const char* const kGameEvents[] = {
+	"player_death",  "bomb_planted", "bomb_defused",  "bomb_dropped", "bomb_pickup",  "round_start",
+	"round_end",     "round_mvp",    "hostage_killed", "hostage_rescued", "weapon_fire", "player_hurt"};
+
 void GiveExpForStreak(LrPlugin& plugin, int slot);
 
 // --- the s2sdk listeners -------------------------------------------------------------------------
@@ -138,28 +147,9 @@ void GiveExpForStreak(LrPlugin& plugin, int slot);
 // same points through these two listeners. OnClientAuthenticated may not fire for real players
 // (see perm_connector), so ReconcileSlots() is the path that actually loads everyone.
 
-void OnClientAuthenticatedListener(int32_t player_slot, uint64_t steamid) {
-	(void)steamid;
+void OnClientAuthenticatedTrampoline(int32_t player_slot, uint64_t steamid) {
 	try {
-		if (player_slot < 0 || player_slot >= kMaxSlots) {
-			return;
-		}
-		LrCore* core = g_lr_plugin.Core();
-		if (core == nullptr || core->IsInitialized(player_slot)) {
-			return;
-		}
-		if (!pisex::g_pPlayers->IsAuthenticated(player_slot) || pisex::g_pPlayers->GetSteamID64(player_slot) == 0) {
-			return; // the reconcile picks the slot up once the engine reports it as ready
-		}
-		const std::string steamid_text = g_lr_plugin.SteamIdOf(player_slot);
-		if (steamid_text.empty()) {
-			return;
-		}
-		if (core->LoadInFlight(player_slot, steamid_text)) {
-			return; // the row is on its way; a second ask would re-issue and reset the slot
-		}
-		g_lr_plugin.NoteLoadAttempt(player_slot);
-		core->LoadOrCreatePlayer(player_slot, steamid_text, g_lr_plugin.PlayerNameOf(player_slot));
+		g_lr_plugin.OnClientAuthenticated(player_slot, steamid);
 	} catch (const std::exception& ex) {
 		LogError(std::string("levels_ranks: exception in OnClientAuthenticated: ") + ex.what());
 	} catch (...) {
@@ -167,23 +157,40 @@ void OnClientAuthenticatedListener(int32_t player_slot, uint64_t steamid) {
 	}
 }
 
-void OnClientDisconnectListener(int32_t player_slot, s2sdk::NetworkDisconnectionReason reason) {
+void OnClientDisconnectTrampoline(int32_t player_slot, s2sdk::NetworkDisconnectionReason reason) {
 	(void)reason;
 	try {
-		if (player_slot < 0 || player_slot >= kMaxSlots) {
-			return;
-		}
-		g_lr_plugin.SetAdminAccess(player_slot, false);
-		// PARITY: the original called SaveDataPlayer(slot, true), whose CheckStatus() also wanted
-		// a live pawn - during a disconnect that is racy, so the port saves whenever the row is
-		// loaded (the counters are what has to reach the database) and always clears the slot.
-		if (LrCore* core = g_lr_plugin.Core(); core != nullptr && core->IsInitialized(player_slot)) {
-			core->SavePlayer(player_slot, true);
-		}
+		g_lr_plugin.OnClientDisconnect(player_slot);
 	} catch (const std::exception& ex) {
 		LogError(std::string("levels_ranks: exception in OnClientDisconnect: ") + ex.what());
 	} catch (...) {
 		LogError("levels_ranks: unknown exception in OnClientDisconnect");
+	}
+}
+
+s2sdk::ResultType EventTrampoline(const plg::string& name, void* event, bool /*dont_broadcast*/) {
+	try {
+		g_lr_plugin.OnGameEvent(name, event);
+	} catch (const std::exception& ex) {
+		LogError(std::string("levels_ranks: exception in a game event handler: ") + ex.what());
+	} catch (...) {
+		LogError("levels_ranks: unknown exception in a game event handler");
+	}
+	// A Pre hook must never swallow the event from the engine or from other plugins.
+	return s2sdk::ResultType::Continue;
+}
+
+void MapStartLifecycle() {
+	try {
+		g_lr_plugin.OnMapStartHook();
+	} catch (...) {
+	}
+}
+
+void MapEndLifecycle() {
+	try {
+		g_lr_plugin.OnMapEndHook();
+	} catch (...) {
 	}
 }
 
@@ -201,25 +208,55 @@ std::string LrPlugin::Phrase(std::string_view key) const {
 	return std::string(key);
 }
 
-void LrPlugin::PrintToChat(int slot, std::string_view text) const {
-	// ClientPrint() of the original: the 'Prefix' phrase in front of every message.
-	if (slot == -1) {
-		pisex::PrintToConsole(-1, "%s %s", Phrase("Prefix").c_str(), std::string(text).c_str());
+void LrPlugin::PrintToConsole(std::string_view text) const {
+	LogInfo(StripColorTags(text));
+}
+
+void LrPlugin::PrintToChatRaw(int slot, std::string_view text) const {
+	if (slot < 0) {
+		PrintToConsole(text);
 		return;
 	}
-	pisex::PrintToChat(slot, "%s %s", Phrase("Prefix").c_str(), std::string(text).c_str());
+	if (!IsMapReady() || !IsSlotInRange(slot) || __s2sdk_PrintToChat == nullptr) {
+		return;
+	}
+	try {
+		s2sdk::PrintToChat(slot, plg::string(Colorize(text)));
+	} catch (...) {
+	}
+}
+
+void LrPlugin::PrintToChat(int slot, std::string_view text) const {
+	const std::string line = Phrase("Prefix") + " " + std::string(text);
+	if (slot < 0) {
+		PrintToConsole(line);
+		return;
+	}
+	if (!IsMapReady() || !IsSlotInRange(slot) || __s2sdk_PrintToChat == nullptr) {
+		return;
+	}
+	try {
+		s2sdk::PrintToChat(slot, plg::string(Colorize(line)));
+	} catch (...) {
+	}
 }
 
 void LrPlugin::PrintToChatAll(std::string_view text) const {
-	pisex::PrintToChatAll("%s %s", Phrase("Prefix").c_str(), std::string(text).c_str());
+	const std::string line = Phrase("Prefix") + " " + std::string(text);
+	if (!IsMapReady() || __s2sdk_PrintToChatAll == nullptr) {
+		return;
+	}
+	try {
+		s2sdk::PrintToChatAll(plg::string(Colorize(line)));
+	} catch (...) {
+	}
 }
 
 // --- configuration ------------------------------------------------------------------------------
 
 bool LrPlugin::LoadSettingsFile() {
-	// LoadConfig() of the original, key for key; the defaults live in lr_core's LoadSettings().
-	pisex::KeyValues kv("LR_Settings");
-	if (!kv.LoadFromFile("addons/configs/levels_ranks/settings.ini")) {
+	KeyValues kv("LR_Settings");
+	if (!kv.LoadFromFile(ResolveConfigPath("addons/configs/levels_ranks/settings.ini"))) {
 		LogError("levels_ranks: cannot read addons/configs/levels_ranks/settings.ini - keeping the "
 				 "built-in defaults");
 		return false;
@@ -230,28 +267,25 @@ bool LrPlugin::LoadSettingsFile() {
 	Settings parsed = LoadSettings(view, &problem);
 	if (!problem.empty()) {
 		// The original unloaded the plugin here; a Failed OnPluginStart would stop *every*
-		// Plugify plugin, so the port fails soft (see the porting rules) and keeps the defaults
-		// of the missing block.
+		// Plugify plugin, so the port fails soft and keeps the defaults of the missing block.
 		LogError("levels_ranks: settings.ini: " + problem);
 	}
 	m_settings = std::move(parsed);
 	m_table_name = m_settings.table_name;
 	if (m_core) {
 		m_core->SetSettings(m_settings);
-		m_table_name = m_settings.table_name; // SetSettings may have rejected the name
+		m_table_name = m_core->GetSettings().table_name;
 	}
 	return true;
 }
 
 bool LrPlugin::LoadPhrases() {
-	// The original merges lr_core.phrases.txt and lr_core_ranks.phrases.txt into one map
-	// (g_vecPhrases); an unknown key answers with the key, like admin_system::GetTranslation.
-	pisex::PhraseMap loaded;
-	if (!pisex::LoadPhrasesFile("addons/translations/lr_core.phrases.txt", loaded)) {
+	PhraseMap loaded;
+	if (!LoadPhrasesFile("addons/translations/lr_core.phrases.txt", loaded)) {
 		LogError("levels_ranks: cannot read lr_core.phrases.txt - phrase keys are printed as-is");
 	}
-	pisex::PhraseMap ranks;
-	if (!pisex::LoadPhrasesFile("addons/translations/lr_core_ranks.phrases.txt", ranks)) {
+	PhraseMap ranks;
+	if (!LoadPhrasesFile("addons/translations/lr_core_ranks.phrases.txt", ranks)) {
 		LogError("levels_ranks: cannot read lr_core_ranks.phrases.txt - rank names are printed as-is");
 	}
 	m_phrases.clear();
@@ -264,23 +298,22 @@ void LrPlugin::ReloadConfig() {
 	LoadSettingsFile();
 	LoadPhrases();
 	if (m_core) {
-		// The ranks and the settings are re-read; the live player state keeps its counters, like
-		// the original's LoadConfig() which also only replaced the globals.
-		m_table_name = m_settings.table_name;
+		m_table_name = m_core->GetSettings().table_name;
 	}
 }
 
 // --- database -----------------------------------------------------------------------------------
 
 bool LrPlugin::EnsureCore() {
-	// The databases.cfg entry of the original (section "levels_ranks"), with "driver" and
-	// "sqlite_path" as optional keys for a SQLite server.
 	plgdb::Config database;
 	database.driver = plgdb::Driver::MySQL;
-	pisex::KeyValues kv("Databases");
+	database.port = 3306;
+	database.database = "levels_ranks";
 	bool have_config = false;
-	if (kv.LoadFromFile("addons/configs/databases.cfg")) {
-		if (pisex::KeyValues* entry = kv.FindKey("levels_ranks", false)) {
+
+	KeyValues kv("Databases");
+	if (kv.LoadFromFile(ResolveConfigPath("addons/configs/databases.cfg"))) {
+		if (KeyValues* entry = kv.FindKey("levels_ranks", false)) {
 			have_config = true;
 			if (const std::string driver = entry->GetString("driver", "mysql"); driver == "sqlite") {
 				database.driver = plgdb::Driver::SQLite;
@@ -291,7 +324,7 @@ bool LrPlugin::EnsureCore() {
 			database.password = entry->GetString("pass", "");
 			database.database = entry->GetString("database", "levels_ranks");
 			if (database.driver == plgdb::Driver::SQLite) {
-				database.sqlitePath = pisex::ResolveDataPath(entry->GetString("sqlite_path", "levels_ranks.sqlite3"));
+				database.sqlitePath = ResolveDataPath(entry->GetString("sqlite_path", "levels_ranks.sqlite3"));
 			}
 		}
 	}
@@ -301,19 +334,22 @@ bool LrPlugin::EnsureCore() {
 		LogError("levels_ranks: no 'levels_ranks' entry in addons/configs/databases.cfg - falling "
 				 "back to a local SQLite database");
 		database.driver = plgdb::Driver::SQLite;
-		database.sqlitePath = pisex::ResolveDataPath("levels_ranks.sqlite3");
+		database.sqlitePath = ResolveDataPath("levels_ranks.sqlite3");
 	}
 
 	m_database = database;
 	m_db = plgdb::Database::Create(database);
 	if (m_db == nullptr) {
-		LogError("levels_ranks: the database configuration is invalid - running without storage");
+		if (!m_core_config_error_logged) {
+			LogError("levels_ranks: the database configuration is invalid - running without storage");
+			m_core_config_error_logged = true;
+		}
 		return false;
 	}
 
 	m_core = std::make_unique<LrCore>(*m_db);
 	m_core->SetSettings(m_settings);
-	m_table_name = m_settings.table_name;
+	m_table_name = m_core->GetSettings().table_name;
 
 	m_core->findPlayerName = [](int slot) { return g_lr_plugin.PlayerNameOf(slot); };
 	m_core->onError = [](std::string_view message) { LogError(std::string(message)); };
@@ -344,32 +380,40 @@ bool LrPlugin::EnsureCore() {
 									  ? g_lr_plugin.Phrase(settings.rank_names[index])
 									  : std::string();
 		if (personal) {
-			g_lr_plugin.PrintToChat(target, up ? pisex::FormatString(g_lr_plugin.Phrase("LevelUp").c_str(), name.c_str())
-											   : pisex::FormatString(g_lr_plugin.Phrase("LevelDown").c_str(), name.c_str()));
+			g_lr_plugin.PrintToChat(target, FormatString(g_lr_plugin.Phrase(up ? "LevelUp" : "LevelDown").c_str(),
+														name.c_str()));
 			return;
 		}
 		const char* key = up ? "LevelUpAll" : "LevelDownAll";
-		g_lr_plugin.PrintToChat(target, pisex::FormatString(g_lr_plugin.Phrase(key).c_str(),
-														   g_lr_plugin.PlayerNameOf(speaker).c_str(), name.c_str()));
+		g_lr_plugin.PrintToChat(target, FormatString(g_lr_plugin.Phrase(key).c_str(),
+													 g_lr_plugin.PlayerNameOf(speaker).c_str(), name.c_str()));
 	};
 	m_core->onExpMessage = [](int slot, const std::string& phrase, int new_exp, int requested) {
 		const std::string value = (requested > 0 ? "+" : "") + std::to_string(requested);
-		g_lr_plugin.PrintToChat(
-			slot, pisex::FormatString(g_lr_plugin.Phrase(phrase).c_str(), new_exp, value.c_str()));
+		g_lr_plugin.PrintToChat(slot, FormatString(g_lr_plugin.Phrase(phrase).c_str(), new_exp, value.c_str()));
 	};
 	m_core->onCoreReady = {[] {
+		if (LrCore* core = g_lr_plugin.Core(); core != nullptr) {
+			core->CleanDatabase();
+		}
 		g_lr_plugin.BroadcastCoreReady();
 	}};
 
-	try {
-		m_core->CreateSchema();
-	} catch (const std::exception& ex) {
-		LogError(std::string("levels_ranks: ") + ex.what());
-		return false;
-	}
-
-	m_core->ConfigureDatabase();
+	m_core->CreateSchemaAsync([this](bool ok) { OnCoreSchemaResult(ok); });
 	return true;
+}
+
+void LrPlugin::OnCoreSchemaResult(bool ok) {
+	if (m_core == nullptr) {
+		return; // the core was torn down while the statements were queued
+	}
+	if (!ok) {
+		// The callback runs from plgdb's Poll(); tearing the core down here would destroy the
+		// object whose callback is still on the stack. OnPluginUpdate does it after the pump.
+		m_core_schema_failed = true;
+		return;
+	}
+	m_core->ConfigureDatabase();
 }
 
 // --- listeners ----------------------------------------------------------------------------------
@@ -378,109 +422,104 @@ void LrPlugin::RegisterListeners() {
 	if (m_listeners_registered) {
 		return;
 	}
-	// Each optional binding is checked on its own (a missing slot is a null function pointer).
-	if (__s2sdk_OnClientAuthenticated_Register) {
-		s2sdk::OnClientAuthenticated_Register(&OnClientAuthenticatedListener);
-	}
-	if (__s2sdk_OnClientDisconnect_Register) {
-		s2sdk::OnClientDisconnect_Register(&OnClientDisconnectListener);
-	}
 	m_listeners_registered = true;
+	const bool auth_pair = __s2sdk_OnClientAuthenticated_Register != nullptr &&
+						   __s2sdk_OnClientAuthenticated_Unregister != nullptr;
+	const bool disconnect_pair = __s2sdk_OnClientDisconnect_Register != nullptr &&
+								 __s2sdk_OnClientDisconnect_Unregister != nullptr;
+	if (auth_pair) {
+		try {
+			s2sdk::OnClientAuthenticated_Register(&OnClientAuthenticatedTrampoline);
+			m_auth_registered = true;
+		} catch (...) {
+			LogError("levels_ranks: could not register the s2sdk OnClientAuthenticated listener");
+		}
+	}
+	if (disconnect_pair) {
+		try {
+			s2sdk::OnClientDisconnect_Register(&OnClientDisconnectTrampoline);
+			m_disconnect_registered = true;
+		} catch (...) {
+			LogError("levels_ranks: could not register the s2sdk OnClientDisconnect listener");
+		}
+	}
+	if (!auth_pair && !disconnect_pair) {
+		LogError("levels_ranks: the s2sdk player-listener bindings are incomplete - the client "
+				 "listeners are disabled");
+	}
 }
 
 void LrPlugin::UnregisterListeners() {
-	if (!m_listeners_registered) {
-		return;
+	if (m_auth_registered && __s2sdk_OnClientAuthenticated_Unregister != nullptr) {
+		try {
+			s2sdk::OnClientAuthenticated_Unregister(&OnClientAuthenticatedTrampoline);
+		} catch (...) {
+		}
 	}
-	if (__s2sdk_OnClientAuthenticated_Unregister) {
-		s2sdk::OnClientAuthenticated_Unregister(&OnClientAuthenticatedListener);
+	if (m_disconnect_registered && __s2sdk_OnClientDisconnect_Unregister != nullptr) {
+		try {
+			s2sdk::OnClientDisconnect_Unregister(&OnClientDisconnectTrampoline);
+		} catch (...) {
+		}
 	}
-	if (__s2sdk_OnClientDisconnect_Unregister) {
-		s2sdk::OnClientDisconnect_Unregister(&OnClientDisconnectListener);
-	}
+	m_auth_registered = false;
+	m_disconnect_registered = false;
 	m_listeners_registered = false;
 }
 
 void LrPlugin::RegisterGameEvents() {
-	// The twelve HookEvent calls of the original's AllPluginsLoaded, same names and same pre mode
-	// (pisexcompat installs the s2sdk pre hook; the handlers below are dispatched by name).
-	pisex::g_pUtils->HookEvent("player_death", [](const char* /*name*/, pisex::IGameEvent* event, bool /*dont*/) {
+	if (__s2sdk_HookEvent == nullptr || __s2sdk_UnhookEvent == nullptr) {
+		LogError("levels_ranks: the s2sdk event bindings are incomplete (HookEvent/UnhookEvent) - "
+				 "the statistics events are disabled");
+		return;
+	}
+	for (const char* name : kGameEvents) {
 		try {
-			g_lr_plugin.OnPlayerDeath(event != nullptr ? event->Native() : nullptr);
+			if (s2sdk::HookEvent(plg::string(name), &EventTrampoline, s2sdk::HookMode::Pre) ==
+				s2sdk::EventHookError::Okay) {
+				m_hooked_events.emplace_back(name);
+			} else {
+				LogError(std::string("levels_ranks: could not hook the game event '") + name + "'");
+			}
 		} catch (...) {
-			LogError("levels_ranks: unknown exception in the player_death hook");
+			LogError(std::string("levels_ranks: could not hook the game event '") + name + "'");
 		}
-	});
-
-	const char* const bomb_events[] = {"bomb_planted", "bomb_defused", "bomb_dropped", "bomb_pickup"};
-	for (const char* name : bomb_events) {
-		pisex::g_pUtils->HookEvent(name, [](const char* event_name, pisex::IGameEvent* event, bool) {
-			try {
-				g_lr_plugin.OnBombEvent(event_name, event != nullptr ? event->Native() : nullptr);
-			} catch (...) {
-				LogError("levels_ranks: unknown exception in a bomb event hook");
-			}
-		});
-	}
-
-	const char* const round_events[] = {"round_start", "round_end", "round_mvp"};
-	for (const char* name : round_events) {
-		pisex::g_pUtils->HookEvent(name, [](const char* event_name, pisex::IGameEvent* event, bool) {
-			try {
-				g_lr_plugin.OnRoundEvent(event_name, event != nullptr ? event->Native() : nullptr);
-			} catch (...) {
-				LogError("levels_ranks: unknown exception in a round event hook");
-			}
-		});
-	}
-
-	const char* const hostage_events[] = {"hostage_killed", "hostage_rescued"};
-	for (const char* name : hostage_events) {
-		pisex::g_pUtils->HookEvent(name, [](const char* event_name, pisex::IGameEvent* event, bool) {
-			try {
-				g_lr_plugin.OnHostageEvent(event_name, event != nullptr ? event->Native() : nullptr);
-			} catch (...) {
-				LogError("levels_ranks: unknown exception in a hostage event hook");
-			}
-		});
-	}
-
-	const char* const other_events[] = {"weapon_fire", "player_hurt"};
-	for (const char* name : other_events) {
-		pisex::g_pUtils->HookEvent(name, [](const char* event_name, pisex::IGameEvent* event, bool) {
-			try {
-				g_lr_plugin.OnOtherEvent(event_name, event != nullptr ? event->Native() : nullptr);
-			} catch (...) {
-				LogError("levels_ranks: unknown exception in a weapon/hurt event hook");
-			}
-		});
 	}
 }
 
+void LrPlugin::UnregisterGameEvents() {
+	if (__s2sdk_UnhookEvent == nullptr) {
+		m_hooked_events.clear();
+		return;
+	}
+	for (const plg::string& name : m_hooked_events) {
+		try {
+			s2sdk::UnhookEvent(name, &EventTrampoline, s2sdk::HookMode::Pre);
+		} catch (...) {
+		}
+	}
+	m_hooked_events.clear();
+}
+
 bool LrPlugin::IsWarmupPeriod() {
-	// g_pGameRules->m_bWarmupPeriod() of the original.
-	//
-	// The field lives on the CCSGameRules OBJECT, not on the CCSGameRulesProxy entity: s2sdk's
-	// GetGameRulesProxy() is the proxy entity while GetGameRules() is the m_pGameRules object
-	// behind it (s2sdk assigns its game-rules global from the proxy's m_pGameRules field). Reading
-	// it through the entity-index helpers would apply a CCSGameRules offset to the proxy's
-	// address - a wrong (and potentially out-of-bounds) read. The object pointer is not an
-	// entity, so the field is read at its schema offset of that pointer, exactly like the
-	// original's member access. The offset is resolved once; it is looked up only after
-	// GetGameRules() answered (a map is up, so the schema system is too), and a miss is kept as
-	// "missing" so a renamed field is logged once instead of re-queried (and re-warned) per call.
-	if (__s2sdk_GetGameRules == nullptr) {
+	// g_pGameRules->m_bWarmupPeriod() of the original. The field lives on the CCSGameRules OBJECT,
+	// not on the CCSGameRulesProxy entity: GetGameRules() is the m_pGameRules object behind it.
+	// The object pointer is not an entity, so the field is read at its schema offset.
+	if (!IsMapReady() || __s2sdk_GetGameRules == nullptr) {
 		return false;
 	}
-	const void* rules = s2sdk::GetGameRules();
+	const void* rules = nullptr;
+	try {
+		rules = s2sdk::GetGameRules();
+	} catch (...) {
+		return false;
+	}
 	if (rules == nullptr) {
 		return false; // no map (the game rules exist only with one)
 	}
 	if (m_warmup_offset == -2) {
-		m_warmup_offset = pisex::SchemaOffset("CCSGameRules", "m_bWarmupPeriod");
+		m_warmup_offset = SchemaOffset("CCSGameRules", "m_bWarmupPeriod");
 		if (m_warmup_offset < 0 && !m_warmup_field_missing_logged) {
-			// A game update renamed the field: lr_block_warmup then cannot be honoured. Log once
-			// so the server shows it instead of silently rating warmup rounds.
 			LogError("levels_ranks: the schema field CCSGameRules::m_bWarmupPeriod was not found - "
 					 "lr_block_warmup cannot be applied");
 			m_warmup_field_missing_logged = true;
@@ -492,54 +531,121 @@ bool LrPlugin::IsWarmupPeriod() {
 	return *reinterpret_cast<const uint8_t*>(static_cast<const char*>(rules) + m_warmup_offset) != 0;
 }
 
+// --- map lifecycle ------------------------------------------------------------------------------
+
+void LrPlugin::OnMapStartHook() {
+	m_since_tick = std::chrono::milliseconds(0);
+	m_clear_allow_next_update = false;
+	m_warmup_offset = -2;
+	m_warmup_field_missing_logged = false;
+	for (int slot = 0; slot < kMaxSlots; ++slot) {
+		m_admin_access.Revoke(slot);
+		m_last_load_attempt[static_cast<std::size_t>(slot)] = 0;
+		m_last_top_request[static_cast<std::size_t>(slot)] = {};
+		m_last_rank_request[static_cast<std::size_t>(slot)] = 0;
+		m_name_cache[static_cast<std::size_t>(slot)].clear();
+	}
+}
+
+void LrPlugin::OnMapEndHook() {
+	// PITFALLS B2: only state here. The menu layer ends the displays through the safe
+	// CancelClientMenu(Disconnect) path itself (no client query from this plugin).
+	CloseMenusOnMapEnd();
+	m_since_tick = std::chrono::milliseconds(0);
+	m_clear_allow_next_update = false;
+	for (int slot = 0; slot < kMaxSlots; ++slot) {
+		m_admin_access.Revoke(slot);
+		m_last_top_request[static_cast<std::size_t>(slot)] = {};
+		m_last_rank_request[static_cast<std::size_t>(slot)] = 0;
+	}
+	if (m_core) {
+		m_core->SetAllowStatistic(false);
+	}
+}
+
 // --- lifecycle ------------------------------------------------------------------------------------
 
 plg::PluginResult LrPlugin::OnPluginStart() {
 	try {
-		pisex::Init(std::string(kPluginName));
+		// A reload starts from a clean per-slot state: the previous instance may have been unloaded
+		// mid-map, so its caches must not leak into this one.
+		m_core_ready = false;
+		m_core_schema_failed = false;
+		m_core_config_error_logged = false;
+		m_core_retry_timer = std::chrono::milliseconds(0);
+		m_since_tick = std::chrono::milliseconds(0);
+		m_clear_allow_next_update = false;
+		for (int slot = 0; slot < kMaxSlots; ++slot) {
+			m_admin_access.Revoke(slot);
+			m_last_load_attempt[static_cast<std::size_t>(slot)] = 0;
+			m_last_top_request[static_cast<std::size_t>(slot)] = {};
+			m_last_rank_request[static_cast<std::size_t>(slot)] = 0;
+			m_name_cache[static_cast<std::size_t>(slot)].clear();
+		}
+		SetMapLifecycleCallbacks(&MapStartLifecycle, &MapEndLifecycle);
+		InitMapGate();
+		StartMenus();
 		LoadPhrases();
 		LoadSettingsFile();
 
+		// The database may be down at this moment (the daily reboot starts MySQL and CS2 together,
+		// a reload can follow a DB restart). The commands, listeners and events do not touch the
+		// engine here (PITFALLS B.1) and the core stays a no-op until it is ready, so they are
+		// registered regardless; EnsureCore is retried from OnPluginUpdate until it succeeds.
 		if (!EnsureCore()) {
-			LogError("levels_ranks: the core is not ready - the plugin runs as a no-op");
-			return plg::PluginResult{};
+			LogError("levels_ranks: the core is not ready - the plugin retries every 10 seconds");
 		}
 
-		RegisterListeners();
 		RegisterCommands();
+		RegisterListeners();
 		RegisterGameEvents();
-
-		// The one-second tick of the reconcile and of the statistics gate. Created from the
-		// startup callback (a live map, like admin_system's timer); until then OnPluginUpdate
-		// pumps it.
-		pisex::RegisterStartupCallback([] {
-			g_lr_plugin.StartSecondTimer();
-			if (g_lr_plugin.Core() != nullptr) {
-				g_lr_plugin.Core()->CleanDatabase();
-			}
-		});
 	} catch (const std::exception& ex) {
 		LogError(std::string("levels_ranks: exception in OnPluginStart: ") + ex.what());
 	} catch (...) {
 		LogError("levels_ranks: unknown exception in OnPluginStart");
 	}
-	return plg::PluginResult{};
+	return plg::PluginResult{}; // never Failed: that stops every Plugify plugin
 }
 
 plg::PluginResult LrPlugin::OnPluginUpdate(std::chrono::milliseconds dt) {
 	try {
-		// pisexcompat first: deferred startup callbacks, timer reschedules and the menu requests
-		// that came out of engine callbacks (which run under s2sdk's locks).
-		pisex::Poll();
+		// Open the gate for a plugin loaded into a running map; the menu queue is drained every
+		// frame (also with the gate shut, to finish the safe teardown of the previous map).
+		PollMapGate();
+		ProcessMenuRequests();
 		if (m_db != nullptr) {
 			m_db->Poll();
 		}
-		if (m_second_timer == nullptr) {
+		if (m_core_schema_failed) {
+			// The asynchronous CREATE TABLE failed: drop the half-built core outside the plgdb
+			// callback that reported it and let the retry below start a fresh attempt.
+			m_core_schema_failed = false;
+			m_core.reset();
+			m_db.reset();
+			m_core_ready = false;
+			m_core_retry_timer = std::chrono::milliseconds(0);
+		}
+		if (m_core == nullptr) {
+			m_core_retry_timer += dt;
+			if (m_core_retry_timer >= kCoreRetryInterval) {
+				m_core_retry_timer = std::chrono::milliseconds(0);
+				(void)EnsureCore();
+			}
+		}
+		if (IsMapReady()) {
+			if (m_clear_allow_next_update) {
+				m_clear_allow_next_update = false;
+				if (m_core) {
+					m_core->SetAllowStatistic(false);
+				}
+			}
 			m_since_tick += dt;
 			if (m_since_tick >= std::chrono::seconds(1)) {
 				m_since_tick = std::chrono::milliseconds(0);
 				OnSecondTick();
 			}
+		} else {
+			m_since_tick = std::chrono::milliseconds(0);
 		}
 	} catch (const std::exception& ex) {
 		LogError(std::string("levels_ranks: exception in OnPluginUpdate: ") + ex.what());
@@ -551,16 +657,23 @@ plg::PluginResult LrPlugin::OnPluginUpdate(std::chrono::milliseconds dt) {
 
 plg::PluginResult LrPlugin::OnPluginEnd() {
 	try {
+		UnregisterGameEvents();
+		UnregisterCommands();
 		UnregisterListeners();
-		if (m_second_timer != nullptr) {
-			pisex::g_pUtils->RemoveTimer(m_second_timer);
-			m_second_timer = nullptr;
-		}
-		pisex::Shutdown();
+		// The menus go before the map gate: ShutdownMenus uses the live gate to close a displayed
+		// backend safely on an unload-mid-map.
+		ShutdownMenus();
+		ShutdownMapGate();
 		// The core goes before the database: its callbacks hold a lifetime token.
 		m_core.reset();
 		m_db.reset();
 		m_core_ready = false;
+		m_core_schema_failed = false;
+		m_core_config_error_logged = false;
+		m_core_retry_timer = std::chrono::milliseconds(0);
+		m_listeners_registered = false;
+		m_phrases.clear();
+		m_local_cookies.clear();
 	} catch (const std::exception& ex) {
 		LogError(std::string("levels_ranks: exception in OnPluginEnd: ") + ex.what());
 	} catch (...) {
@@ -572,12 +685,26 @@ plg::PluginResult LrPlugin::OnPluginEnd() {
 // --- player helpers ---------------------------------------------------------------------------------
 
 std::string LrPlugin::PlayerNameOf(int slot) const {
-	const char* name = pisex::g_pPlayers->GetPlayerName(slot);
-	return name != nullptr ? std::string(name) : std::string();
+	if (!IsSlotInRange(slot)) {
+		return {};
+	}
+	const std::size_t index = static_cast<std::size_t>(slot);
+	if (!IsMapReady()) {
+		return m_name_cache[index];
+	}
+	std::string name = ClientName(slot);
+	if (!name.empty()) {
+		m_name_cache[index] = name;
+		return name;
+	}
+	return m_name_cache[index];
 }
 
 std::string LrPlugin::SteamIdOf(int slot) const {
-	return ConvertSteamID(pisex::g_pPlayers->GetSteamID(slot));
+	if (!IsSlotInRange(slot)) {
+		return {};
+	}
+	return ConvertSteamID(ClientAuthId(slot));
 }
 
 bool LrPlugin::CheckStatus(int slot) {
@@ -586,25 +713,38 @@ bool LrPlugin::CheckStatus(int slot) {
 	if (slot < 0 || slot >= kMaxSlots || m_core == nullptr) {
 		return false;
 	}
-	const bool engine_ok = pisex::g_pPlayers->IsConnected(slot) && pisex::GetPawnEntity(slot) != 0 &&
-						   pisex::g_pPlayers->GetSteamID64(slot) > 0 && pisex::g_pPlayers->IsAuthenticated(slot);
-	if (!engine_ok) {
-		m_core->MarkUninitialized(slot); // (the original cleared bInitialized as well)
+	if (!IsMapReady()) {
 		return false;
 	}
-	return m_core->IsInitialized(slot);
+	const bool engine_ok =
+		IsClientConnected(slot) && ClientSteamId64(slot) > 0 && IsClientAuthenticated(slot);
+	if (!engine_ok) {
+		m_core->MarkUninitialized(slot); // the original cleared bInitialized as well
+		return false;
+	}
+	if (!m_core->IsInitialized(slot)) {
+		return false;
+	}
+	if (!HasPawn(slot)) {
+		// A spectator/team-less player has no pawn. The original refused the credit then, but the
+		// port's reconcile keeps the row so the counters since the last save are not lost.
+		return false;
+	}
+	const std::string steamid = SteamIdOf(slot);
+	return steamid.empty() || m_core->FindPlayer(slot)->steamid == steamid;
 }
 
 std::string LrPlugin::Cookie(int slot, std::string_view name) {
 	const std::string key = std::string(kCookiePrefix) + std::string(name);
-	const uint64_t steamid64 = pisex::g_pPlayers->GetSteamID64(slot);
+	const uint64_t steamid64 = ClientSteamId64(slot);
 	if (steamid64 != 0 && __permissions_GetCookie != nullptr) {
 		plg::any value;
-		if (permissions::GetCookie(steamid64, plg::string(key), value) == permissions::Status::Success) {
-			return AnyToString(value);
+		try {
+			if (permissions::GetCookie(steamid64, plg::string(key), value) == permissions::Status::Success) {
+				return AnyToString(value);
+			}
+		} catch (...) {
 		}
-		// Not answered (the user is not loaded yet, the storage is not ready): fall through to the
-		// local store, which SetCookie fills when the permissions plugin cannot take a value.
 	} else if (!m_cookie_warning_logged && __permissions_GetCookie == nullptr) {
 		LogError("levels_ranks: the permissions plugin is missing - the cookies live in memory only "
 				 "for this session");
@@ -621,18 +761,60 @@ std::string LrPlugin::Cookie(int slot, std::string_view name) {
 
 void LrPlugin::SetCookie(int slot, std::string_view name, std::string value) {
 	const std::string key = std::string(kCookiePrefix) + std::string(name);
-	const uint64_t steamid64 = pisex::g_pPlayers->GetSteamID64(slot);
+	const uint64_t steamid64 = ClientSteamId64(slot);
 	if (steamid64 != 0 && __permissions_SetCookie != nullptr) {
-		const permissions::Status status =
-			permissions::SetCookie(static_cast<int64_t>(GetId()), steamid64, plg::string(key),
-								   plg::any(plg::string(value)), /*dontBroadcast=*/false);
-		if (status == permissions::Status::Success) {
-			return;
+		try {
+			const permissions::Status status =
+				permissions::SetCookie(static_cast<int64_t>(GetId()), steamid64, plg::string(key),
+									   plg::any(plg::string(value)), /*dontBroadcast=*/false);
+			if (status == permissions::Status::Success) {
+				return;
+			}
+		} catch (...) {
 		}
-		// The permissions user may not be loaded yet: keep the value locally, otherwise the
-		// cooldown of ResetMyStats would be silently dropped.
 	}
 	m_local_cookies[SteamIdOf(slot)][key] = std::move(value);
+}
+
+// --- client listeners -------------------------------------------------------------------------------
+
+void LrPlugin::OnClientAuthenticated(int slot, uint64_t /*steamid*/) {
+	if (!IsMapReady() || slot < 0 || slot >= kMaxSlots) {
+		return;
+	}
+	LrCore* core = Core();
+	if (core == nullptr || !IsCoreLoaded() || core->IsInitialized(slot)) {
+		return;
+	}
+	if (!IsClientAuthenticated(slot) || ClientSteamId64(slot) == 0) {
+		return; // the reconcile picks the slot up once the engine reports it as ready
+	}
+	const std::string steamid_text = SteamIdOf(slot);
+	if (steamid_text.empty()) {
+		return;
+	}
+	if (core->LoadInFlight(slot, steamid_text)) {
+		return; // the row is on its way; a second ask would re-issue and reset the slot
+	}
+	NoteLoadAttempt(slot);
+	core->LoadOrCreatePlayer(slot, steamid_text, PlayerNameOf(slot));
+}
+
+void LrPlugin::OnClientDisconnect(int slot) {
+	if (slot < 0 || slot >= kMaxSlots) {
+		return;
+	}
+	SetAdminAccess(slot, false);
+	// PARITY: the original called SaveDataPlayer(slot, true), whose CheckStatus() also wanted a
+	// live pawn - during a disconnect that is racy, so the port saves whenever the row is loaded.
+	// The name comes from the cache when the map is already down (no client query is legal then).
+	if (LrCore* core = Core(); core != nullptr && core->IsInitialized(slot)) {
+		core->SavePlayer(slot, true);
+	}
+	m_name_cache[static_cast<std::size_t>(slot)].clear();
+	m_last_load_attempt[static_cast<std::size_t>(slot)] = 0;
+	m_last_top_request[static_cast<std::size_t>(slot)] = {};
+	m_last_rank_request[static_cast<std::size_t>(slot)] = 0;
 }
 
 // --- listener fan-out ---------------------------------------------------------------------------------
@@ -797,15 +979,18 @@ void LrPlugin::BroadcastDatabaseCleanup(int type) {
 void LrPlugin::CheckAllowStatistic(bool round_start) {
 	// CheckAllowStatistic() of the original: at least lr_minplayers_count players with a team and
 	// a pawn, and - with lr_block_warmup - not in the warmup period.
+	if (!IsMapReady()) {
+		return;
+	}
 	int players = 0;
 	for (int slot = 0; slot < kMaxSlots; ++slot) {
-		if (!pisex::g_pPlayers->IsConnected(slot) || pisex::g_pPlayers->GetSteamID64(slot) <= 0) {
+		if (!IsClientConnected(slot) || ClientSteamId64(slot) <= 0) {
 			continue;
 		}
-		if (pisex::GetPawnEntity(slot) == 0 || pisex::GetControllerEntity(slot) == 0) {
+		if (!HasPawn(slot) || !HasController(slot)) {
 			continue;
 		}
-		if (pisex::GetPlayerTeam(slot) > 1) {
+		if (ClientTeam(slot) > 1) {
 			++players;
 		}
 	}
@@ -820,34 +1005,14 @@ void LrPlugin::CheckAllowStatistic(bool round_start) {
 		return;
 	}
 	for (int slot = 0; slot < kMaxSlots; ++slot) {
-		if (!pisex::g_pPlayers->IsConnected(slot) || pisex::g_pPlayers->GetSteamID64(slot) <= 0) {
+		if (!IsClientConnected(slot) || ClientSteamId64(slot) <= 0) {
 			continue;
 		}
 		if (warning) {
-			PrintToChat(slot, pisex::FormatString(Phrase("RoundStartCheckCount").c_str(), players,
-												 m_settings.Value(LR_MinplayersCount)));
+			PrintToChat(slot, FormatString(Phrase("RoundStartCheckCount").c_str(), players,
+										   m_settings.Value(LR_MinplayersCount)));
 		}
 		PrintToChat(slot, Phrase("RoundStartMessageRanks"));
-	}
-}
-
-void LrPlugin::StartSecondTimer() {
-	if (m_second_timer != nullptr) {
-		return;
-	}
-	try {
-		m_second_timer = pisex::g_pUtils->CreateTimer(1.0f, [] {
-			try {
-				g_lr_plugin.OnSecondTick();
-			} catch (...) {
-				LogError("levels_ranks: unknown exception in the one-second tick");
-			}
-			return 1.0f;
-		});
-	} catch (const std::exception& ex) {
-		LogError(std::string("levels_ranks: cannot start the one-second timer: ") + ex.what());
-	} catch (...) {
-		LogError("levels_ranks: cannot start the one-second timer");
 	}
 }
 
@@ -860,41 +1025,34 @@ void LrPlugin::OnSecondTick() {
 }
 
 void LrPlugin::ReconcileSlots() {
-	if (m_core == nullptr) {
+	if (m_core == nullptr || !m_core_ready || !IsMapReady()) {
 		return;
 	}
 	for (int slot = 0; slot < kMaxSlots; ++slot) {
 		try {
-			if (!pisex::g_pPlayers->IsConnected(slot)) {
-				m_admin_access[slot] = false;
-				m_last_load_attempt[slot] = 0;
+			if (!IsClientConnected(slot)) {
+				m_admin_access.Revoke(slot);
+				m_last_load_attempt[static_cast<std::size_t>(slot)] = 0;
+				m_last_top_request[static_cast<std::size_t>(slot)] = {};
+				m_last_rank_request[static_cast<std::size_t>(slot)] = 0;
 				continue;
 			}
-			if (!pisex::g_pPlayers->IsAuthenticated(slot) || pisex::g_pPlayers->GetSteamID64(slot) == 0) {
+			if (!IsClientAuthenticated(slot) || ClientSteamId64(slot) == 0) {
 				continue;
 			}
 			const std::string steamid = SteamIdOf(slot);
 			if (steamid.empty()) {
 				continue;
 			}
-			// A loaded slot whose row belongs to the player on it needs nothing; a slot whose row
-			// still holds the previous occupant (a disconnect without the save) is loaded again for
-			// the player who is there now.
 			if (const PlayerInfo* info = m_core->FindPlayer(slot);
 				info != nullptr && info->initialized && info->steamid == steamid) {
 				continue;
 			}
-			// A row that is still on its way is never asked for twice: the old reconcile re-issued
-			// the load after kLoadRetrySeconds while the previous one was unanswered, which reset
-			// the slot (the counters counted since the last save were thrown away when the second
-			// answer landed) and raced the two INSERTs of a new player. Only a load that failed or
-			// has not answered for the core's kLoadTimeoutSeconds may be retried, and the core's
-			// retry keeps the counters of the same player.
 			if (m_core->LoadInFlight(slot, steamid)) {
 				continue;
 			}
 			const int64_t now = static_cast<int64_t>(std::time(nullptr));
-			if (now - m_last_load_attempt[slot] < kLoadRetrySeconds) {
+			if (now - m_last_load_attempt[static_cast<std::size_t>(slot)] < kLoadRetrySeconds) {
 				continue;
 			}
 			NoteLoadAttempt(slot);
@@ -921,6 +1079,9 @@ namespace {
 // GiveExpForStreakKills() of the original: the streak bonus of the kill streaks, then the kill
 // counter is reset and - with lr_db_savedataplayer_mode - the row is saved.
 void GiveExpForStreak(LrPlugin& plugin, int slot) {
+	if (slot < 0 || slot >= kMaxSlots) {
+		return;
+	}
 	LrCore* core = plugin.Core();
 	if (core == nullptr) {
 		return;
@@ -945,19 +1106,59 @@ void GiveExpForStreak(LrPlugin& plugin, int slot) {
 	}
 }
 
+bool EventBool(void* event, const char* key) {
+	if (event == nullptr || key == nullptr || __s2sdk_GetEventBool == nullptr) {
+		return false;
+	}
+	try {
+		return s2sdk::GetEventBool(event, plg::string(key));
+	} catch (...) {
+		return false;
+	}
+}
+
+int32_t EventInt(void* event, const char* key) {
+	if (event == nullptr || key == nullptr || __s2sdk_GetEventInt == nullptr) {
+		return 0;
+	}
+	try {
+		return s2sdk::GetEventInt(event, plg::string(key));
+	} catch (...) {
+		return 0;
+	}
+}
+
 } // namespace
 
+void LrPlugin::OnGameEvent(const plg::string& name, void* event) {
+	const std::string_view event_name(name.data(), name.size());
+	if (event_name == "player_death") {
+		OnPlayerDeath(event);
+	} else if (event_name == "bomb_planted" || event_name == "bomb_defused" ||
+			   event_name == "bomb_dropped" || event_name == "bomb_pickup") {
+		OnBombEvent(std::string(event_name).c_str(), event);
+	} else if (event_name == "round_start" || event_name == "round_end" || event_name == "round_mvp") {
+		OnRoundEvent(std::string(event_name).c_str(), event);
+	} else if (event_name == "hostage_killed" || event_name == "hostage_rescued") {
+		OnHostageEvent(std::string(event_name).c_str(), event);
+	} else if (event_name == "weapon_fire" || event_name == "player_hurt") {
+		OnOtherEvent(std::string(event_name).c_str(), event);
+	}
+}
+
 void LrPlugin::OnPlayerDeath(void* event) {
-	if (m_core == nullptr || event == nullptr) {
+	if (m_core == nullptr || event == nullptr || !IsMapReady()) {
 		return;
 	}
-	pisex::IGameEvent handle(event);
-	const int client = handle.GetInt("userid");
-	const int attacker = handle.GetInt("attacker");
-	const int assister = handle.GetInt("assister");
+	const bool map_ready = IsMapReady();
+	// Player-typed fields: the 0..63 slot of the player, never the raw user id GetInt would answer
+	// (see lr_event_fields.hpp).
+	const int client = EventPlayerSlot(event, "userid", map_ready);
+	const int attacker = EventPlayerSlot(event, "attacker", map_ready);
+	const int assister = EventPlayerSlot(event, "assister", map_ready);
 
 	// The original credited through NotifClient(), whose CheckStatus() required a pawn.
-	if (assister >= 0 && assister < kMaxSlots && pisex::GetPawnEntity(assister) != 0) {
+	if (assister >= 0 && assister < kMaxSlots && HasPawn(assister)) {
 		if (m_core->GiveExp(assister, m_settings.Stats(LR_ExpGiveAssist), "AssisterKill").status) {
 			if (PlayerInfo* info = m_core->FindPlayer(assister); info != nullptr) {
 				info->stats[ST_ASSISTS]++;
@@ -968,22 +1169,20 @@ void LrPlugin::OnPlayerDeath(void* event) {
 
 	if (attacker >= 0 && attacker < kMaxSlots && client >= 0 && client < kMaxSlots) {
 		if (attacker == client) {
-			if (!pisex::g_pPlayers->IsFakeClient(client)) {
+			if (!IsFakeClient(client)) {
 				m_core->GiveExp(client, -m_settings.Stats(LR_ExpGiveSuicide), "Suicide");
 			}
 		} else {
 			// The original required a controller and a pawn for both sides before it read the
 			// teams (and returned from the whole handler when one was missing).
-			if (pisex::GetControllerEntity(client) == 0 ||
-				pisex::GetPawnEntity(client) == 0 ||
-				pisex::GetControllerEntity(attacker) == 0 ||
-				pisex::GetPawnEntity(attacker) == 0) {
+			if (!HasController(client) || !HasPawn(client) || !HasController(attacker) ||
+				!HasPawn(attacker)) {
 				return;
 			}
 			// PARITY: the original's team comparison counts two team-less pawns (both 0) as a
 			// team kill as well.
-			const bool same_team = !m_settings.Value(LR_AllAgainstAll) &&
-								   pisex::GetPlayerTeam(client) == pisex::GetPlayerTeam(attacker);
+			const bool same_team =
+				!m_settings.Value(LR_AllAgainstAll) && ClientTeam(client) == ClientTeam(attacker);
 			if (same_team) {
 				m_core->GiveExp(attacker, -m_settings.Stats(LR_ExpGiveTeamKill), "TeamKill");
 			} else {
@@ -995,8 +1194,8 @@ void LrPlugin::OnPlayerDeath(void* event) {
 				const int victim_exp = victim_info->stats[ST_EXP];
 				const int attacker_exp = attacker_info->stats[ST_EXP];
 
-				const bool fake_client = pisex::g_pPlayers->IsFakeClient(client) || !victim_info->initialized;
-				const bool fake_attacker = pisex::g_pPlayers->IsFakeClient(attacker) || !attacker_info->initialized;
+				const bool fake_client = IsFakeClient(client) || !victim_info->initialized;
+				const bool fake_attacker = IsFakeClient(attacker) || !attacker_info->initialized;
 
 				int exp_attacker = 0;
 				int exp_victim = 0;
@@ -1023,10 +1222,9 @@ void LrPlugin::OnPlayerDeath(void* event) {
 
 				const ExpResult attacker_result = m_core->GiveExp(attacker, exp_attacker, "Kill");
 				const ExpResult victim_result = m_core->GiveExp(client, -exp_victim, "MyDeath");
-				// PARITY: the original summed the two booleans (`+`) to enter this block.
 				if (attacker_result.status || victim_result.status) {
 					if (!fake_attacker) {
-						if (handle.GetBool("headshot") &&
+						if (EventBool(event, "headshot") &&
 							m_core->GiveExp(attacker, m_settings.Stats(LR_ExpGiveHeadShot), "HeadShotKill").status) {
 							if (PlayerInfo* info = m_core->FindPlayer(attacker); info != nullptr) {
 								info->stats[ST_HEADSHOTS]++;
@@ -1059,13 +1257,13 @@ void LrPlugin::OnPlayerDeath(void* event) {
 }
 
 void LrPlugin::OnBombEvent(const char* name, void* event) {
-	if (m_core == nullptr || event == nullptr) {
+	if (m_core == nullptr || event == nullptr || !IsMapReady()) {
 		return;
 	}
-	pisex::IGameEvent handle(event);
-	const int slot = handle.GetInt("userid");
-	if (slot < 0 || slot >= kMaxSlots || pisex::GetPawnEntity(slot) == 0) {
-		// NotifClient() of the original required a pawn before it credited the slot.
+	// "userid" is player-typed: bomb_pickup's is a player_pawn field, the other three carry the
+	// controller pair (lr_event_fields.hpp).
+	const int slot = EventPlayerSlot(event, "userid", IsMapReady());
+	if (slot < 0 || slot >= kMaxSlots || !HasPawn(slot)) {
 		return;
 	}
 	const std::string_view event_name(name != nullptr ? name : "");
@@ -1079,8 +1277,6 @@ void LrPlugin::OnBombEvent(const char* name, void* event) {
 		return;
 	}
 	if (event_name == "bomb_planted") {
-		// PARITY: the original tests the *return* of NotifClient (CheckStatus + the statistic
-		// gate), not whether an amount was applied.
 		if (m_core->GiveExp(slot, m_settings.Stats(LR_ExpBombPlanted), "BombPlanted").status) {
 			info->have_bomb = false;
 		}
@@ -1100,10 +1296,9 @@ void LrPlugin::OnBombEvent(const char* name, void* event) {
 }
 
 void LrPlugin::OnRoundEvent(const char* name, void* event) {
-	if (m_core == nullptr || event == nullptr) {
+	if (m_core == nullptr || event == nullptr || !IsMapReady()) {
 		return;
 	}
-	pisex::IGameEvent handle(event);
 	const std::string_view event_name(name != nullptr ? name : "");
 
 	if (event_name == "round_start") {
@@ -1112,25 +1307,24 @@ void LrPlugin::OnRoundEvent(const char* name, void* event) {
 	}
 
 	if (event_name == "round_mvp") {
-		const int slot = handle.GetInt("userid");
-		// NotifClient() of the original required a pawn before it credited the slot.
-		if (slot >= 0 && slot < kMaxSlots && pisex::GetPawnEntity(slot) != 0) {
+		const int slot = EventPlayerSlot(event, "userid", IsMapReady());
+		if (slot >= 0 && slot < kMaxSlots && HasPawn(slot)) {
 			m_core->GiveExp(slot, m_settings.Stats(LR_ExpRoundMVP), "RoundMVP");
 		}
 		return;
 	}
 
-	// round_end
-	const int winner = handle.GetInt("winner");
+	// round_end: "winner" is the numeric team/winner id, so GetEventInt stays.
+	const int winner = EventInt(event, "winner");
 	if (winner > 1) {
 		for (int slot = 0; slot < kMaxSlots; ++slot) {
-			if (!pisex::g_pPlayers->IsConnected(slot) || pisex::g_pPlayers->GetSteamID64(slot) <= 0) {
+			if (!IsClientConnected(slot) || ClientSteamId64(slot) <= 0) {
 				continue;
 			}
-			if (pisex::GetPawnEntity(slot) == 0) {
+			if (!HasPawn(slot)) {
 				continue;
 			}
-			const int team = pisex::GetPlayerTeam(slot);
+			const int team = ClientTeam(slot);
 			if (team > 1) {
 				const bool lose = team != winner;
 				const ExpResult result = lose ? m_core->GiveExp(slot, -m_settings.Stats(LR_ExpRoundLose), "RoundLose")
@@ -1142,20 +1336,20 @@ void LrPlugin::OnRoundEvent(const char* name, void* event) {
 					}
 				}
 			}
-			if (pisex::GetPlayerHealth(slot) > 0) {
+			if (ClientHealth(slot) > 0) {
 				GiveExpForStreak(*this, slot);
 			}
 			if (m_settings.Value(LR_ShowUsualMessage) == 2) {
 				const PlayerInfo* info = m_core->FindPlayer(slot);
 				if (info != nullptr) {
 					if (info->round_exp != 0) {
-						PrintToChat(slot, pisex::FormatString(
+						PrintToChat(slot, FormatString(
 											 Phrase(info->round_exp > 0 ? "RoundExpResultGive" : "RoundExpResultTake").c_str(),
 											 info->round_exp));
 					} else {
 						PrintToChat(slot, Phrase("RoundExpResultNothing"));
 					}
-					PrintToChat(slot, pisex::FormatString(Phrase("RoundExpResultAll").c_str(), info->stats[ST_EXP]));
+					PrintToChat(slot, FormatString(Phrase("RoundExpResultAll").c_str(), info->stats[ST_EXP]));
 					if (PlayerInfo* mutable_info = m_core->FindPlayer(slot); mutable_info != nullptr) {
 						mutable_info->round_exp = 0;
 					}
@@ -1166,23 +1360,17 @@ void LrPlugin::OnRoundEvent(const char* name, void* event) {
 
 	if (m_settings.Value(LR_GiveExpRoundEnd) == 0) {
 		// The original cleared the flag on the next frame; one update later is the same frame
-		// boundary (pisexcompat drains NextFrame from Poll()).
-		pisex::g_pUtils->NextFrame([] {
-			if (g_lr_plugin.Core() != nullptr) {
-				g_lr_plugin.Core()->SetAllowStatistic(false);
-			}
-		});
+		// boundary.
+		m_clear_allow_next_update = true;
 	}
 }
 
 void LrPlugin::OnHostageEvent(const char* name, void* event) {
-	if (m_core == nullptr || event == nullptr) {
+	if (m_core == nullptr || event == nullptr || !IsMapReady()) {
 		return;
 	}
-	pisex::IGameEvent handle(event);
-	const int slot = handle.GetInt("userid");
-	if (slot < 0 || slot >= kMaxSlots || pisex::GetPawnEntity(slot) == 0) {
-		// NotifClient() of the original required a pawn before it credited the slot.
+	const int slot = EventPlayerSlot(event, "userid", IsMapReady());
+	if (slot < 0 || slot >= kMaxSlots || !HasPawn(slot)) {
 		return;
 	}
 	const std::string_view event_name(name != nullptr ? name : "");
@@ -1194,17 +1382,14 @@ void LrPlugin::OnHostageEvent(const char* name, void* event) {
 }
 
 void LrPlugin::OnOtherEvent(const char* name, void* event) {
-	if (m_core == nullptr || event == nullptr || !m_core->CountPlayersAllowed()) {
+	if (m_core == nullptr || event == nullptr || !m_core->CountPlayersAllowed() || !IsMapReady()) {
 		return;
 	}
-	pisex::IGameEvent handle(event);
 	const std::string_view event_name(name != nullptr ? name : "");
 
 	if (event_name == "weapon_fire") {
-		const int slot = handle.GetInt("userid");
-		if (slot >= 0 && slot < kMaxSlots && pisex::GetControllerEntity(slot) != 0) {
-			// PARITY: the original required the controller of "userid" to exist and incremented
-			// the counters only for a loaded slot.
+		const int slot = EventPlayerSlot(event, "userid", IsMapReady());
+		if (slot >= 0 && slot < kMaxSlots && HasController(slot)) {
 			if (PlayerInfo* info = m_core->FindPlayer(slot); info != nullptr && info->initialized) {
 				info->stats[ST_SHOOTS]++;
 				info->session[ST_SHOOTS]++;
@@ -1214,14 +1399,14 @@ void LrPlugin::OnOtherEvent(const char* name, void* event) {
 	}
 
 	// player_hurt
-	const int slot = handle.GetInt("userid");
+	const int slot = EventPlayerSlot(event, "userid", IsMapReady());
 	if (slot < 0 || slot >= kMaxSlots) {
 		return;
 	}
-	if (pisex::GetControllerEntity(slot) == 0) {
+	if (!HasController(slot)) {
 		return;
 	}
-	const int attacker = handle.GetInt("attacker");
+	const int attacker = EventPlayerSlot(event, "attacker", IsMapReady());
 	if (attacker < 0 || attacker >= kMaxSlots || attacker == slot) {
 		return;
 	}
@@ -1382,7 +1567,6 @@ extern "C" PLUGIN_API plg::vector<plg::string> GetDatabaseConfig() {
 		result.reserve(6);
 		const plgdb::Config& config = g_lr_plugin.DatabaseSettings();
 		result.emplace_back(config.driver == plgdb::Driver::SQLite ? "sqlite" : "mysql");
-		// SQLite hands out the file path in the host slot; there is no user/password then.
 		result.emplace_back(config.driver == plgdb::Driver::SQLite ? config.sqlitePath : config.host);
 		result.emplace_back(std::to_string(config.port));
 		result.emplace_back(config.driver == plgdb::Driver::SQLite ? "" : config.user);

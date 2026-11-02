@@ -37,6 +37,39 @@ std::string TopOrderExpression(bool by_playtime) {
 	return by_playtime ? "`playtime` / 3600.0" : "`value`";
 }
 
+// The asynchronous CreateSchema chain: one statement at a time, kept alive across the gaps between
+// them by the completion callback's own reference (no self-reference, so it is freed when done).
+struct SchemaJob : std::enable_shared_from_this<SchemaJob> {
+	std::function<void(std::string, plgdb::Callback)> query;
+	std::function<void(std::string)> report;
+	std::string table;
+	std::vector<std::string> statements;
+	std::size_t index = 0;
+	std::function<void(bool)> done;
+
+	void Step() {
+		if (index >= statements.size()) {
+			if (done) {
+				done(true);
+			}
+			return;
+		}
+		const std::size_t current = index++;
+		const std::shared_ptr<SchemaJob> self = shared_from_this();
+		query(statements[current], [self, current](const plgdb::Result& result) {
+			if (current == 0 && !result.Ok()) {
+				self->report("levels_ranks: creating the " + self->table + " table failed: " + result.Error());
+				if (self->done) {
+					self->done(false);
+				}
+				return;
+			}
+			// The statements after the CREATE are the tolerated MySQL-only ones (see CreateSchema).
+			self->Step();
+		});
+	}
+};
+
 } // namespace
 
 // --- settings ---------------------------------------------------------------------------------
@@ -333,7 +366,7 @@ void LrCore::ResetPlayerData(int slot) {
 
 // --- schema -------------------------------------------------------------------------------------
 
-void LrCore::CreateSchema() {
+std::vector<std::string> LrCore::SchemaStatements() const {
 	const bool mysql = m_db.GetDriver() == plgdb::Driver::MySQL;
 	const std::string table = m_settings.table_name;
 
@@ -341,7 +374,8 @@ void LrCore::CreateSchema() {
 	// Only the driver-specific syntax differs (COLLATE/varchar/INT for MySQL, TEXT/INTEGER for the
 	// SQLite fallback, which has no charset support).
 	const std::string name_collate = m_settings.Value(LR_DB_Allow_UTF8MB4) ? "utf8mb4_unicode_ci" : "utf8_unicode_ci";
-	const std::string create = mysql
+	std::vector<std::string> statements;
+	statements.push_back(mysql
 		? "CREATE TABLE IF NOT EXISTS `" + table + "` ("
 		  "`steam` varchar(22) COLLATE 'utf8_unicode_ci' PRIMARY KEY, "
 		  "`name` varchar(32) COLLATE '" + name_collate + "', "
@@ -375,16 +409,11 @@ void LrCore::CreateSchema() {
 		  "`playtime` INTEGER NOT NULL DEFAULT 0, "
 		  "`lastconnect` INTEGER NOT NULL DEFAULT 0, "
 		  "`online` INTEGER NOT NULL DEFAULT 0"
-		  ");";
-
-	const plgdb::Result created = m_db.QuerySync(create, {});
-	if (!created.Ok()) {
-		throw std::runtime_error("levels_ranks: creating the " + table + " table failed: " + created.Error());
-	}
+		  ");");
 
 	if (!mysql) {
-		return; // the ALTER/CHARSET statements below are MySQL-only (the SQLite fallback is a
-				// local test database, the schema above is already the final one)
+		return statements; // the ALTER/CHARSET statements below are MySQL-only (the SQLite fallback
+						   // is a local test database, the schema above is already the final one)
 	}
 
 	// The statements the original ran right after the CREATE TABLE. The ADD COLUMN fails on every
@@ -393,17 +422,36 @@ void LrCore::CreateSchema() {
 	const std::string charset = m_settings.Value(LR_DB_Allow_UTF8MB4) ? "utf8mb4" : "utf8";
 	const std::string suffix = m_settings.Value(LR_DB_Charset_Type) ? "_unicode_ci" : "_general_ci";
 
-	const std::string statements[] = {
-		"ALTER TABLE `" + table + "` ADD COLUMN `online` int NOT NULL DEFAULT 0;",
-		"SET NAMES '" + charset + "';",
-		"SET CHARSET '" + charset + "';",
-		"ALTER TABLE `" + table + "` CHARACTER SET '" + charset + "' COLLATE '" + charset + suffix + "';",
-		"ALTER TABLE `" + table + "` MODIFY COLUMN `name` varchar(128) CHARACTER SET '" + charset + "' COLLATE '" +
-			charset + suffix + "' NOT NULL default '' AFTER `steam`;",
-	};
-	for (const std::string& statement : statements) {
-		(void)m_db.QuerySync(statement, {}); // tolerated failures (see above)
+	statements.push_back("ALTER TABLE `" + table + "` ADD COLUMN `online` int NOT NULL DEFAULT 0;");
+	statements.push_back("SET NAMES '" + charset + "';");
+	statements.push_back("SET CHARSET '" + charset + "';");
+	statements.push_back("ALTER TABLE `" + table + "` CHARACTER SET '" + charset + "' COLLATE '" + charset + suffix + "';");
+	statements.push_back("ALTER TABLE `" + table + "` MODIFY COLUMN `name` varchar(128) CHARACTER SET '" + charset +
+						 "' COLLATE '" + charset + suffix + "' NOT NULL default '' AFTER `steam`;");
+	return statements;
+}
+
+void LrCore::CreateSchema() {
+	const std::vector<std::string> statements = SchemaStatements();
+	const plgdb::Result created = m_db.QuerySync(statements.front(), {});
+	if (!created.Ok()) {
+		throw std::runtime_error("levels_ranks: creating the " + m_settings.table_name + " table failed: " + created.Error());
 	}
+	for (std::size_t i = 1; i < statements.size(); ++i) {
+		(void)m_db.QuerySync(statements[i], {}); // tolerated failures (see SchemaStatements)
+	}
+}
+
+void LrCore::CreateSchemaAsync(std::function<void(bool)> done) {
+	const std::shared_ptr<SchemaJob> job = std::make_shared<SchemaJob>();
+	job->query = [this](std::string sql, plgdb::Callback callback) {
+		Query(std::move(sql), {}, std::move(callback));
+	};
+	job->report = [this](std::string message) { ReportError(message); };
+	job->table = m_settings.table_name;
+	job->statements = SchemaStatements();
+	job->done = std::move(done);
+	job->Step();
 }
 
 void LrCore::ConfigureDatabase() {
@@ -896,6 +944,11 @@ void LrCore::CleanupData(int type, std::function<void(bool)> done) {
 		if (!result.Ok()) {
 			ReportError("levels_ranks: cleaning the database failed: " + result.Error());
 		}
+		if (result.Ok()) {
+			// The rows the cleanup just changed must not be served from the top cache.
+			m_top_cache[0].loaded = false;
+			m_top_cache[1].loaded = false;
+		}
 		if (done) {
 			done(result.Ok());
 		}
@@ -903,26 +956,51 @@ void LrCore::CleanupData(int type, std::function<void(bool)> done) {
 }
 
 void LrCore::LoadTopPlayers(bool by_playtime, std::function<void(std::vector<TopRow>)> callback) {
+	const std::size_t index = by_playtime ? 1 : 0;
+	TopCache& cache = m_top_cache[index];
+	if (cache.loaded && Now() - cache.loaded_at < kTopCacheSeconds) {
+		if (callback) {
+			callback(cache.rows);
+		}
+		return;
+	}
+	if (callback) {
+		cache.waiting.push_back(std::move(callback));
+	}
+	if (cache.in_flight) {
+		return; // the answer that is already on its way notifies this caller too
+	}
+	cache.in_flight = true;
+
 	const std::string column = TopOrderExpression(by_playtime);
 	const std::string sql = "SELECT `name`, `steam`, " + column + " FROM " + Table() + " WHERE `lastconnect` ORDER BY " +
 							column + " DESC LIMIT ?;";
 	Query(sql, {static_cast<int64_t>(m_settings.Value(LR_TopCount))},
-		  [this, callback = std::move(callback)](const plgdb::Result& result) {
-			  std::vector<TopRow> rows;
+		  [this, index](const plgdb::Result& result) {
+			  TopCache& cache = m_top_cache[index];
+			  cache.in_flight = false;
+			  cache.rows.clear();
 			  if (!result.Ok()) {
 				  ReportError("levels_ranks: reading the top list failed: " + result.Error());
+				  cache.loaded = false; // the next caller asks the database again
 			  } else {
-				  rows.reserve(result.RowCount());
+				  cache.rows.reserve(result.RowCount());
 				  for (std::size_t row = 0; row < result.RowCount(); ++row) {
 					  TopRow entry;
 					  entry.name = result.GetString(row, 0);
 					  entry.steamid = result.GetString(row, 1);
 					  entry.value = result.GetDouble(row, 2);
-					  rows.push_back(std::move(entry));
+					  cache.rows.push_back(std::move(entry));
 				  }
+				  cache.loaded = true;
+				  cache.loaded_at = Now();
 			  }
-			  if (callback) {
-				  callback(std::move(rows));
+			  std::vector<std::function<void(std::vector<TopRow>)>> waiting = std::move(cache.waiting);
+			  cache.waiting.clear();
+			  for (const auto& waiter : waiting) {
+				  if (waiter) {
+					  waiter(cache.rows);
+				  }
 			  }
 		  });
 }

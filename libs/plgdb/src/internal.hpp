@@ -5,6 +5,7 @@
 #include <plgdb/db.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -30,9 +31,11 @@ void Log(std::string_view message);
 //     driver's constructor, after its own members exist),
 //   * FIFO job queue (mutex + condvar),
 //   * completion queue drained by Poll() on the caller thread,
-//   * StopWorker(): stop accepting work, drain the queue (flush), join, then
-//     discard completions that were never polled (those callbacks are dropped
-//     without being called).
+//   * StopWorker(): stop accepting work, drain the queue (flush) for at most
+//     ~3 s so an unreachable database cannot block the caller for minutes,
+//     drop whatever is left, join, then discard completions that were never
+//     polled (those callbacks are dropped without being called). The statement
+//     already running on the worker is never interrupted.
 class DatabaseBase : public Database {
 public:
 	explicit DatabaseBase(Config config) : config_(std::move(config)) {}
@@ -88,6 +91,7 @@ private:
 	std::condition_variable queueCv_;
 	std::deque<Job> queue_;
 	bool stopping_ = false; // guarded by queueMutex_
+	std::chrono::steady_clock::time_point stopRequested_{}; // guarded by queueMutex_
 	bool started_ = false;  // guarded by queueMutex_
 	std::mutex completionMutex_;
 	std::deque<Completion> completions_;

@@ -23,8 +23,8 @@
 //     - a Rating_Extended kill by a player with 0 experience divided by zero in the original
 //       (undefined behaviour); here the ratio is treated as 1.
 //   * every statement is asynchronous (plgdb) and its effects are applied from the callback, which
-//     plgdb only runs inside Poll() on the game thread. CreateSchema() (and the schema half of
-//     ConfigureDatabase()) is the only blocking statement, called once at plugin start.
+//     plgdb only runs inside Poll() on the game thread. CreateSchema() is the blocking form used
+//     by the tests; the plugin calls CreateSchemaAsync() and never blocks the game thread.
 
 #include <array>
 #include <cstdint>
@@ -134,9 +134,14 @@ inline constexpr int kRatingStartExp = 1000;
 // plugin's real time (the tests and the bench override it with a simulated one).
 inline constexpr int64_t kLoadTimeoutSeconds = 60;
 
+// How long a top list may be served from memory before the database is asked again. The query is a
+// full scan + sort of the statistics table on the single connection every save uses, and !top can
+// be called from a chat key bind; the cache keeps a burst of requests to one query per interval.
+inline constexpr int64_t kTopCacheSeconds = 5;
+
 // --- settings ---------------------------------------------------------------------------------
 // The model of settings.ini. The defaults are the ones of LoadConfig() in levels_ranks.cpp; the
-// file is parsed by the plugin (pisexcompat KeyValues) and handed over through LoadSettings().
+// file is parsed by the plugin-local KV1 reader and handed over through LoadSettings().
 struct Settings {
 	std::string table_name = "lvl_base";  // lr_table
 	std::string plugin_title;             // lr_plugin_title (no default in the original: empty)
@@ -167,8 +172,8 @@ struct Settings {
 };
 
 // --- the configuration source -----------------------------------------------------------------
-// What LoadSettings() needs of a KV1 tree, so the core does not depend on the pisexcompat parser:
-// the plugin implements it over pisex::KeyValues, the tests over a literal tree. |section| is the
+// What LoadSettings() needs of a KV1 tree, so the core does not depend on the parser:
+// the plugin implements it over its KeyValues reader, the tests over a literal tree. |section| is the
 // name of a KV1 block; "" is the root node ("LR_Settings" of the original), whose *direct* child
 // lookup is what made the original read lr_resetmystats_cooldown from the wrong node (see
 // LoadSettings).
@@ -260,6 +265,11 @@ public:
 	// legitimately fail on a schema created by an older version (ADD COLUMN `online`) are
 	// tolerated.
 	void CreateSchema();
+	// The non-blocking form the plugin uses: the same statements, one at a time; |done| is called
+	// with true after the CREATE (and the tolerated tail) ran, and with false after a failed
+	// CREATE. A database that is down at plugin start therefore does not block the game thread,
+	// and the plugin can retry the whole bring-up later.
+	void CreateSchemaAsync(std::function<void(bool ok)> done);
 	// The asynchronous tail of the original's connect callback: SELECT COUNT(steam) -> the player
 	// count, UPDATE online = 0 WHERE online = lr_online_id, then the onCoreReady hook (the
 	// SendCoreIsReady of the original).
@@ -396,6 +406,8 @@ public:
 private:
 	void Query(std::string sql, plgdb::Params params, plgdb::Callback callback);
 	void ReportError(std::string_view message) const;
+	// The CREATE TABLE first, then the tolerated MySQL-only statements (see CreateSchema).
+	std::vector<std::string> SchemaStatements() const;
 	bool SlotInRange(int slot) const;
 	bool Status(int slot) const; // the database half of CheckStatus: bInitialized
 	void FireCoreReady();
@@ -424,8 +436,19 @@ private:
 	// so the reconcile may ask again (kLoadRetrySeconds after it).
 	void FailLoad(int slot, uint64_t generation, std::string message);
 
+	// The two top lists (experience / play time): rows read within kTopCacheSeconds are reused and
+	// callers arriving while a query runs wait for its result instead of issuing another one.
+	struct TopCache {
+		bool loaded = false;
+		bool in_flight = false;
+		int64_t loaded_at = 0;
+		std::vector<TopRow> rows;
+		std::vector<std::function<void(std::vector<TopRow>)>> waiting;
+	};
+
 	plgdb::Database& m_db;
 	Settings m_settings;
+	std::array<TopCache, 2> m_top_cache;
 	std::function<int64_t()> m_clock;
 	std::array<PlayerInfo, kMaxSlots> m_players;
 	std::array<SlotLoad, kMaxSlots> m_loads;

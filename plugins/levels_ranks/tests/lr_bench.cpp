@@ -77,27 +77,10 @@
 
 #include <plgdb/db.hpp>
 
-#include <plg/plugin.hpp>
-#include <pisex/keyvalues.hpp>
 
 #include "lr_core.hpp"
 #include "lr_keyvalues.hpp"
-
-// The plg globals a Plugify plugin defines through PLUGIFY_PLUGIN; pisexcompat (the KV1 parser
-// used here) references a few of them, so the bench provides them (null = the fallbacks apply),
-// exactly like tests/lr_core_tests.cpp does.
-namespace plg {
-GetBaseDirFn GetBaseDir{nullptr};
-GetExtensionsDirFn GetExtensionsDir{nullptr};
-GetConfigsDirFn GetConfigsDir{nullptr};
-GetDataDirFn GetDataDir{nullptr};
-GetLogsDirFn GetLogsDir{nullptr};
-GetCacheDirFn GetCacheDir{nullptr};
-IsLoadedFn IsLoaded{nullptr};
-LogFn Log{nullptr};
-BeginZoneFn BeginZone{nullptr};
-EndZoneFn EndZone{nullptr};
-} // namespace plg
+#include "lr_kv1.hpp"
 
 #ifndef LR_TEST_DATA_DIR
 #define LR_TEST_DATA_DIR "."
@@ -1698,7 +1681,7 @@ int main(int argc, char** argv) {
 	// The settings of the shipped settings.ini, through the plugin's own parser (the same path as
 	// levels_ranks/LoadSettingsFile); lr_db_savedataplayer_mode is the shipped 1.
 	const std::string settings_path = std::string(LR_TEST_DATA_DIR) + "/settings.ini";
-	pisex::KeyValues kv("LR_Settings");
+	levels_ranks::KeyValues kv("LR_Settings");
 	if (!kv.LoadFromFile(settings_path)) {
 		std::printf("FATAL: cannot read %s\n", settings_path.c_str());
 		return 2;
